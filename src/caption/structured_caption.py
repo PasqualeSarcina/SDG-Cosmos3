@@ -1,5 +1,96 @@
 import json
 import re
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+class _CaptionModel(BaseModel):
+    # Preserve image-specific attributes rather than silently dropping them.
+    model_config = ConfigDict(extra="allow")
+
+
+class Subject(_CaptionModel):
+    description: str | None = None
+    appearance_details: str | None = None
+    relationship: str | None = None
+    location: str | None = None
+    relative_size: str | None = None
+    orientation: str | None = None
+    pose: str | None = None
+    clothing: str | None = None
+    expression: str | None = None
+    gender: str | None = None
+    age: str | None = None
+    skin_tone_and_texture: str | None = None
+    facial_features: str | None = None
+    number_of_subjects: int | None = Field(default=None, ge=0)
+    number_of_arms: int | None = Field(default=None, ge=0)
+    number_of_legs: int | None = Field(default=None, ge=0)
+    number_of_hands: int | None = Field(default=None, ge=0)
+    number_of_fingers: int | None = Field(default=None, ge=0)
+
+
+class Lighting(_CaptionModel):
+    conditions: str | None = None
+    direction: str | None = None
+    shadows: str | None = None
+    illumination_effect: str | None = None
+
+
+class Aesthetics(_CaptionModel):
+    composition: str | None = None
+    color_scheme: str | None = None
+    mood_atmosphere: str | None = None
+    patterns: str | None = None
+
+
+class Cinematography(_CaptionModel):
+    framing: str | None = None
+    camera_angle: str | None = None
+    depth_of_field: str | None = None
+    focus: str | None = None
+    lens_focal_length: str | None = None
+
+
+class TextElement(_CaptionModel):
+    text: str | None = None
+    category: str | None = None
+    appearance: str | None = None
+    spatial: str | None = None
+    context: str | None = None
+
+
+class QuadrantScan(_CaptionModel):
+    top_left: str | None = None
+    top_right: str | None = None
+    bottom_left: str | None = None
+    bottom_right: str | None = None
+    absolute_center: str | None = None
+
+
+class Resolution(_CaptionModel):
+    H: int = Field(gt=0)
+    W: int = Field(gt=0)
+
+
+class StructuredCaption(_CaptionModel):
+    """Validate the image-caption template without generation-size constraints."""
+
+    comprehensive_t2i_caption: str = Field(min_length=1)
+    subjects: list[Subject] | None = None
+    subject_details: dict[str, Any] | None = None
+    background_setting: str | None = None
+    lighting: Lighting | None = None
+    aesthetics: Aesthetics | None = None
+    cinematography: Cinematography | None = None
+    style_medium: str | None = None
+    artistic_style: str | None = None
+    context: str | None = None
+    text_and_signage_elements: list[TextElement] | None = None
+    quadrant_scan: QuadrantScan | None = None
+    resolution: Resolution | None = None
+    aspect_ratio: str | None = None
 
 
 def extract_xml_tag(text: str, tag: str) -> str | None:
@@ -100,19 +191,19 @@ def media_fields_from_metadata(meta: tuple[int, int]) -> dict:
         "aspect_ratio": aspect_ratio_str(width, height),
     }
 
-def assemble_caption_json(scene_draft: dict, final_prompt: str, media: dict) -> dict:
+def assemble_caption_json(scene_draft: dict, comprehensive_t2i_caption: str, media: dict) -> dict:
     """Assemble the final caption object and validate it.
 
-    * ``temporal_caption`` is set to the polished Phase-2 ``final_prompt`` (this
-      is what keeps the dense narrative available *inside* the JSON and equal to
-      ``caption.txt``), overriding any draft value from Phase 1.
+    * ``comprehensive_t2i_caption`` contains the polished Phase-2 narrative,
+      equal to ``caption.txt``, overriding any draft value from Phase 1.
     * ``media`` (from :func:`media_fields_from_metadata`) is merged in.
 
     Returns a normalised ``dict`` (None-valued fields dropped, types coerced).
     Raises ``pydantic.ValidationError`` if the structure is unusable.
     """
     data: dict[str, Any] = dict(scene_draft)
-    data["temporal_caption"] = (final_prompt or "").strip()
     data.update(media)
+    data.pop("temporal_caption", None)
+    data["comprehensive_t2i_caption"] = (comprehensive_t2i_caption or "").strip()
     model = StructuredCaption.model_validate(data)
     return model.model_dump(exclude_none=True, mode="json")

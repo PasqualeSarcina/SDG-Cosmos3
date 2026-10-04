@@ -1,0 +1,86 @@
+{
+  "subjects": [
+    {
+      "description": "Overprocessed vehicles with plastic-looking paint, excessively polished surfaces, unnaturally uniform material response, and fine mechanical details replaced by smoothed shapes.",
+      "appearance_details": "Airbrushed bodywork, exaggerated clear-coat highlights, clipped reflections, dark panels reduced to featureless black patches, smeared grille openings, indistinct wheel spokes, melted panel seams, and brittle oversharpened contours.",
+      "relationship": "Broken occlusion between overlapping vehicles, reflected scene fragments inconsistent with the reflecting surface, and tires with detached or indistinct ground contact.",
+      "location": "Material and contour artifacts on foreground vehicles; unresolved mechanical structures on middle-ground and distant vehicles.",
+      "relative_size": "Inconsistent wheel-to-body proportions and fine details whose apparent scale contradicts viewing distance.",
+      "orientation": "Wheel ellipses, window frames, and body contours following incompatible local perspective.",
+      "pose": "Deformed rigid bodywork, discontinuous panel boundaries, and wheels misaligned with the chassis.",
+      "clothing": "",
+      "expression": "",
+      "gender": "N/A",
+      "age": "N/A",
+      "skin_tone_and_texture": "",
+      "facial_features": "",
+      "number_of_subjects": 0,
+      "number_of_arms": 0,
+      "number_of_legs": 0,
+      "number_of_hands": 0,
+      "number_of_fingers": 0
+    },
+    {
+      "description": "Artificial-looking people with waxy skin, airbrushed features, anatomically incoherent body parts, and rigid mannequin-like posture.",
+      "appearance_details": "Smoothed or fused fingers, ambiguous hand structure, malformed wrists, extra or missing digits, and body outlines merging into clothing or nearby objects.",
+      "relationship": "Hands intersecting solid objects, arms merging into vehicle windows, broken body continuity across occlusions, and implausible foot contact with the ground.",
+      "location": "Anatomical reconstruction defects on visible people at any scene depth, including occupants seen through glass and partially visible foreground arms or hands.",
+      "relative_size": "Heads, hands, feet, and limbs disproportionate to the body; human scale incompatible with nearby vehicles and scene perspective.",
+      "orientation": "Impossible head rotation, twisted wrists and ankles, and inconsistent alignment between the head, torso, and limbs.",
+      "pose": "Impossible joint bends, twisted wrists, incoherent finger articulation, stiff gestures, and unsupported weight distribution.",
+      "clothing": "Fabric reduced to flat painted patches, melted seams, repeated synthetic weave patterns, and folds unrelated to posture or material weight.",
+      "expression": "Rigid mannequin-like expressions and mechanically distorted facial muscle structure.",
+      "gender": "Unknown",
+      "age": "Unknown",
+      "skin_tone_and_texture": "Wax-like skin, excessive denoising, erased natural skin texture, artificial pore patterns, harsh local contrast around joints, and abrupt shading transitions unrelated to illumination.",
+      "facial_features": "Misaligned eye structures, duplicated pupils, fused eyelids, malformed teeth, melted lips, smeared hair boundaries, and invented high-frequency facial detail inconsistent with viewing distance.",
+      "number_of_subjects": 0,
+      "number_of_arms": 2,
+      "number_of_legs": 2,
+      "number_of_hands": 2,
+      "number_of_fingers": 10
+    }
+  ],
+  "subject_details": {
+    "surface_processing": "Excessive denoising, airbrushed materials, plastic-looking paint or skin, and local contrast enhancement that replaces gradual surface shading with harsh tonal boundaries.",
+    "synthetic_grain": "Dense artificial speckling across sky, walls, paint, and vegetation; noise of identical strength and scale across unrelated materials; grain that obscures fine structure.",
+    "false_detail": "Sharpened noise masquerading as texture, invented microdetail unrelated to surface geometry, and finely speckled areas lacking coherent underlying structure.",
+    "vegetation": "Foliage reconstructed as granular clouds, repeated leaf clusters, tangled texture blobs, and sharpened speckles replacing distinct branch or leaf boundaries.",
+    "fine_geometry": "Fence bars, overhead wires, railings, wheel spokes, and panel seams that merge, split, break, or change thickness without a structural cause.",
+    "paving": "Texture tiling, cloned crack motifs, abrupt changes in grid spacing on a continuous road plane, and paving patterns inconsistent with surface perspective.",
+    "reflections": "Painted-on highlights, reflected contours disconnected from the surrounding scene, and mirror or window reflections crossing their physical boundaries.",
+    "human_anatomy": "Malformed hands, fused fingers, extra or missing limbs, impossible joints, disproportionate body parts, and physically incoherent contact with nearby objects."
+  },
+  "background_setting": "Background architecture, parked vehicles, and vegetation reconstructed with inconsistent detail. Building surfaces are airbrushed while foliage is excessively speckled; distant vehicles collapse into fused shapes. Railings and wires become broken strokes, and road surfaces contain cloned texture patches or inconsistent perspective. Fine surface variation is replaced by either featureless smoothing or artificial high-frequency noise.",
+  "lighting": {
+    "conditions": "Excessive contrast, clipped highlights, crushed dark surfaces, and exaggerated local tone mapping that removes gradual material shading.",
+    "direction": "Highlight and shading directions incompatible with the same scene illumination, especially across paint, glass, and skin.",
+    "shadows": "Featureless black shadow regions, detached contact shadows, and artificial dark halos around object edges or surface details.",
+    "illumination_effect": "HDR-like tonal exaggeration, glowing edge halos, unnaturally glossy paint, and harsh tonal separation that makes ordinary surfaces resemble a stylized render."
+  },
+  "aesthetics": {
+    "composition": "Cutout-like separation of scene layers, broken occlusion boundaries, and inconsistent depth cues between foreground objects and the background.",
+    "color_scheme": "Excessive saturation in paint and foliage, oversimplified uniform colors, clipped color channels, and abrupt color transitions between neighboring materials.",
+    "mood_atmosphere": "Overprocessed, airbrushed, artificially crisp photographic appearance; inconsistent material realism.",
+    "patterns": "Cloned texture patches, repeated foliage clusters, moire on fine grids, jagged linework, edge ringing, and artificial speckling unrelated to material structure."
+  },
+  "cinematography": {
+    "framing": "Artificial seams or cutout boundaries at windshield frames, mirrors, vehicle contours, and natural occlusions.",
+    "camera_angle": "Local warping of rigid objects and incompatible perspective between the road plane, vehicle components, and architectural lines.",
+    "depth_of_field": "N/A",
+    "focus": "Oversharpening halos, doubled edge contours, coarse reconstruction noise, and loss of fine structure within the focal plane. Abrupt changes in detail on continuous surfaces at the same depth, and smearing whose shape contradicts plausible optical defocus or object motion.",
+    "lens_focal_length": "Localized stretching, inconsistent magnification, and perspective distortions unrelated to a coherent lens projection."
+  },
+  "style_medium": "Overprocessed synthetic photography with airbrushed surfaces, exaggerated contrast, artificial grain, and sharpened reconstruction noise.",
+  "artistic_style": "Plastic-looking CGI realism, aggressive HDR processing, excessive denoising, brittle edge enhancement, and inconsistent texture reconstruction.",
+  "context": "Material, anatomical, and fine-structure defects in generated still photographs of street environments, vehicles, and people.",
+  "text_and_signage_elements": [],
+  "quadrant_scan": {
+    "top_left": "Granular foliage, broken fine structures, airbrushed facades, and sharpening halos wherever present in this region.",
+    "top_right": "Artificial grain in sky or walls, oversharpened foliage, clipped highlights, and discontinuous architectural lines wherever present in this region.",
+    "bottom_left": "Plastic-looking vehicle surfaces, crushed dark panels, smeared wheel details, and cloned road textures wherever present in this region.",
+    "bottom_right": "Incoherent mirror reflections, broken contact shadows, artificial road microtexture, and melted object boundaries wherever present in this region.",
+    "absolute_center": "Excessive surface smoothing, false microdetail, broken thin structures, and incoherent visible anatomy wherever present in this region."
+  },
+  "comprehensive_t2i_caption": "An overprocessed synthetic photograph with airbrushed surfaces, plastic-looking car paint and human skin, excessive contrast, oversaturated colors, clipped highlights, and crushed shadows that erase surface detail. Artificial high-frequency grain covers smooth sky, walls, and painted surfaces; sharpened noise replaces coherent material texture. Foliage forms granular clouds or cloned clusters, distant vehicles become fused silhouettes, and thin railings, wires, wheel spokes, and panel seams break or merge. Edge halos, doubled contours, harsh local tone mapping, and abrupt changes in detail create an artificially crisp, cutout-like appearance. Reflections are painted on or geometrically incoherent, rigid components have inconsistent perspective, and ground contact lacks coherent shadows. Visible people have malformed hands, fused or extra fingers, twisted joints, unrealistic proportions, waxy faces, distorted eyes or teeth, painted-on clothing, and incoherent contact with nearby objects."
+}
