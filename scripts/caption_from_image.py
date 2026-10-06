@@ -8,7 +8,7 @@ from tqdm import tqdm
 from PIL import Image
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import asyncio
 import openai
@@ -21,7 +21,7 @@ if not __package__:
     sys.path.insert(0, str(_PACKAGE_DIR))
 
 from src.caption.structured_caption import extract_xml_tag, parse_structured_caption, media_fields_from_metadata, \
-    assemble_caption_json
+    assemble_caption_json, parse_caption_fragments
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"]
 log = logging.getLogger(__name__)
@@ -52,11 +52,15 @@ class Args(pydantic.BaseModel):
     """Maximum number of attempts for each image, including the first request."""
     max_tokens: int = pydantic.Field(default=4096, ge=1)
     """Maximum output tokens per request; increase if the response is truncated."""
-    timeout: float = pydantic.Field(default=600.0, gt=0)
+    timeout: float = pydantic.Field(default=1200.0, gt=0)
     """Per-request client timeout in seconds; a hung request fails after this and is retried."""
 
     prompt_template_path: Path | None = None
-    """Path to a custom prompt template. Defaults to the built-in image_captioner.txt."""
+    """Custom prompt template. Otherwise selected automatically by prompt_mode."""
+
+    prompt_mode: Literal["default", "augmentation"] = "default"
+    """Generation template only. Augmentation produces two base JSON phases for later processing;
+    no weather/time preset is applied during generation."""
 
     debug: bool = False
     """If True, save raw API responses for debugging."""
@@ -187,13 +191,16 @@ async def _process_single(
             media = {}
 
         try:
+            if args.prompt_mode == "augmentation":
+                # Validate the base JSON, but preserve it for the separate offline stage.
+                parse_caption_fragments(comprehensive_t2i_caption)
             caption_json = assemble_caption_json(scene_draft, comprehensive_t2i_caption, media)
-        except pydantic.ValidationError as e:
+        except ValueError as e:
             response_path = output_dir / str(i_retry) / "response.json"
             response_path.parent.mkdir(parents=True, exist_ok=True)
             response_path.write_text(response.model_dump_json(), encoding="utf-8")
             log.warning(
-                "[%s/%s] caption_json failed validation for %s: %s; raw response: %s",
+                "[%s/%s] Caption processing failed for %s: %s; raw response: %s",
                 i_retry + 1, args.max_retries, name, e, response_path,
             )
             continue
@@ -295,7 +302,8 @@ async def caption_from_image(args: Args):
     if args.prompt_template_path:
         prompt_template = args.prompt_template_path.read_text(encoding="utf-8")
     else:
-        prompt_template = (_PACKAGE_DIR / "src/caption/image_captioner.txt").read_text(encoding="utf-8")
+        template_name = "image_captioner_for_augm.txt" if args.prompt_mode == "augmentation" else "image_captioner.txt"
+        prompt_template = (_PACKAGE_DIR / "src/caption" / template_name).read_text(encoding="utf-8")
 
     items = _collect_image_items(args)
 

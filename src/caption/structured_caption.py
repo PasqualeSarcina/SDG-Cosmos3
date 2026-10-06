@@ -107,6 +107,17 @@ def _strip_code_fences(text: str) -> str:
     return cleaned.strip()
 
 
+def parse_caption_fragments(text: str) -> dict:
+    """Parse the Phase-2 JSON object used as input to offline augmentation."""
+    try:
+        parsed = json.loads(_strip_code_fences(text))
+    except json.JSONDecodeError as exc:
+        raise ValueError("Expected valid Phase-2 JSON") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("Expected a Phase-2 JSON object")
+    return parsed
+
+
 def _first_json_object(text: str) -> str | None:
     """Return the first balanced ``{...}`` block in ``text``, or ``None``.
 
