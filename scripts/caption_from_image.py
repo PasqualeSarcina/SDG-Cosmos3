@@ -4,7 +4,6 @@ import logging
 import sys
 import time
 
-from tqdm import tqdm
 from PIL import Image
 
 from pathlib import Path
@@ -23,6 +22,9 @@ if not __package__:
 from src.caption.structured_caption import extract_xml_tag, parse_structured_caption, media_fields_from_metadata, \
     assemble_caption_json
 
+from src.request.client import chat_completion, create_client, resolve_model, run_batch, with_retries
+from src.request.response_errors import response_content
+
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"]
 log = logging.getLogger(__name__)
 
@@ -36,7 +38,7 @@ class Args(pydantic.BaseModel):
 
     image: Annotated[Path | None, tyro.conf.arg(aliases=("-i",))] = None
     """Path to a single image file or a directory of images.
-    Mutually exclusive with --input_files."""
+    Only files directly in the directory are processed. Mutually exclusive with --input_files."""
 
     mask: Path | None = None
     """Optional mask file or directory, paired with --image by filename stem.
@@ -44,7 +46,7 @@ class Args(pydantic.BaseModel):
     Not supported with --input-files."""
 
     output_dir: Annotated[Path, tyro.conf.arg(aliases=("-o",))]
-    """Output directory for generated captions."""
+    """Output directory; image.jpg becomes image.json, with no per-image subdirectories."""
 
     server: str = "http://localhost:8000/v1"
     """The URL of the OpenAI-compatible VLM API server."""
@@ -64,10 +66,10 @@ class Args(pydantic.BaseModel):
     """Path to a custom prompt template. Defaults to the built-in image_captioner.txt."""
 
     debug: bool = False
-    """If True, save raw API responses for debugging."""
+    """Save complete API responses to output_dir/debug/<name>.attempt-<attempt>.json."""
 
     raw_content: bool = False
-    """Save message.content verbatim to caption.txt, bypassing structured caption parsing."""
+    """Save message.content verbatim to <name>.json, bypassing structured caption parsing."""
 
 
 def _is_remote_ref(ref: str) -> bool:
@@ -116,30 +118,6 @@ def _build_vlm_messages(
     ]
 
 
-def _extract_caption_text(message) -> tuple[str, str | None]:
-    """Recover tagged output misplaced by an OpenAI-compatible reasoning parser.
-
-    Ordinary reasoning without a complete caption is not accepted as output.
-    """
-    text = (message.content or "").strip()
-    if text:
-        return text, None
-    for field in ("reasoning", "reasoning_content"):
-        candidate = getattr(message, field, None)
-        if not isinstance(candidate, str):
-            continue
-        scene = extract_xml_tag(candidate, "scene_draft")
-        narrative = extract_xml_tag(candidate, "comprehensive_t2i_caption")
-        if scene and narrative and parse_structured_caption(candidate) is not None:
-            # Retain only the explicit output sections, not surrounding reasoning.
-            return (
-                f"<scene_draft>{scene}</scene_draft>\n"
-                f"<comprehensive_t2i_caption>{narrative}</comprehensive_t2i_caption>",
-                field,
-            )
-    return "", None
-
-
 async def _process_single(
     args: Args,
     client: openai.AsyncOpenAI,
@@ -151,7 +129,8 @@ async def _process_single(
 ) -> bool:
     assert args.model
 
-    output_dir = args.output_dir / name
+    output_dir = args.output_dir
+    output_path = output_dir / f"{name}.json"
     try:
         messages = _build_vlm_messages(
             image_ref, prompt_template,
@@ -163,83 +142,41 @@ async def _process_single(
         log.error("Cannot read image %s (%s): %s", name, image_ref, e)
         return False
 
-    for i_retry in range(args.max_retries):
+    async def _attempt(i_retry: int) -> bool:
         started = time.monotonic()
         log.info("[%s/%s] Sending image %s", i_retry + 1, args.max_retries, name)
-        try:
-            response = await client.chat.completions.create(
-                model=args.model,
-                messages=messages,
-                max_tokens=args.max_tokens,
-                temperature=0.7,  #nvfp4 0.7
-                top_p=0.8,      #nvfp4 0.8
-                #extra_body={"top_k": 20, "min_p": 0.0},
-                extra_body={
-                    "top_k": 20,
-                    "presence_penalty": 1.5,
-                    "repetition_penalty": 1.0,
-                    "chat_template_kwargs": {
-                        "enable_thinking": False
-                    }
+        response_path = output_dir / "debug" / f"{name}.attempt-{i_retry}.json" if args.debug else None
+        response = await chat_completion(
+            client, response_path=response_path,
+            model=args.model,
+            messages=messages,
+            max_tokens=args.max_tokens,
+            temperature=0.7,  #nvfp4 0.7
+            top_p=0.8,      #nvfp4 0.8
+            #extra_body={"top_k": 20, "min_p": 0.0},
+            extra_body={
+                "top_k": 20,
+                "presence_penalty": 1.5,
+                "repetition_penalty": 1.0,
+                "chat_template_kwargs": {
+                    "enable_thinking": False
                 }
-            )
-        except Exception as e:
-            log.warning(
-                "[%s/%s] API error for %s after %.1fs at %s: %s: %s; cause: %r",
-                i_retry + 1, args.max_retries, name, time.monotonic() - started,
-                args.server, type(e).__name__, e, e.__cause__,
-                exc_info=args.debug,
-            )
-            if i_retry + 1 < args.max_retries:
-                await asyncio.sleep(1)
-            continue
-
-        choice = response.choices[0] if len(response.choices) == 1 else None
-        if args.raw_content:
-            text = (choice.message.content or "") if choice else ""
-            recovered_field = None
-        else:
-            text, recovered_field = _extract_caption_text(choice.message) if choice else ("", None)
-        if recovered_field:
-            log.warning(
-                "%s: message.content is empty; recovered tagged caption from message.%s. "
-                "Check the server reasoning parser configuration.", name, recovered_field,
-            )
+            }
+        )
+        text = response_content(response, max_tokens=args.max_tokens, response_path=response_path)
         comprehensive_t2i_caption = None
         scene_draft = None
         if not args.raw_content:
             comprehensive_t2i_caption = extract_xml_tag(text, "comprehensive_t2i_caption")
             scene_draft = parse_structured_caption(text)
-        failure = None
-        if choice is None:
-            failure = f"Expected one choice, received {len(response.choices)}"
-        elif choice.finish_reason != "stop":
-            failure = f"Invalid finish_reason={choice.finish_reason!r} (max_tokens={args.max_tokens})"
-        elif not text.strip():
-            failure = "Empty response content"
-        elif not args.raw_content and not comprehensive_t2i_caption:
-            failure = "Missing or empty <comprehensive_t2i_caption> tag"
-        elif not args.raw_content and scene_draft is None:
-            failure = "Invalid scene_draft JSON"
-
-        response_path = None
-        if args.debug:
-            retry_dir = output_dir / f"{i_retry}"
-            retry_dir.mkdir(parents=True, exist_ok=True)
-            response_path = retry_dir / "response.json"
-            response_path.write_text(response.model_dump_json(), encoding="utf-8")
-        if failure:
-            log.warning(
-                "[%s/%s] %s for %s after %.1fs; usage=%s; raw response: %s",
-                i_retry + 1, args.max_retries, failure, name,
-                time.monotonic() - started, response.usage,
-                response_path or "not saved (enable --debug)",
-            )
-            continue
+            if not comprehensive_t2i_caption:
+                raise ValueError("Missing or empty <comprehensive_t2i_caption> tag")
+            if scene_draft is None:
+                raise ValueError("Invalid scene_draft JSON")
 
         if args.raw_content:
             output_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / "caption.json").write_text(text, encoding="utf-8")
+            output_path.write_text(text, encoding="utf-8")
             log.info("Caption saved for %s after %.1fs: %s", name, time.monotonic() - started, output_dir)
             return True
 
@@ -257,55 +194,27 @@ async def _process_single(
         else:
             media = {}
 
-        try:
-            caption_json = assemble_caption_json(scene_draft, comprehensive_t2i_caption, media)
-        except pydantic.ValidationError as e:
-            log.warning(
-                "[%s/%s] caption_json failed validation for %s: %s; raw response: %s",
-                i_retry + 1, args.max_retries, name, e,
-                response_path or "not saved (enable --debug)",
-            )
-            continue
+        caption_json = assemble_caption_json(scene_draft, comprehensive_t2i_caption, media)
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        (output_dir / "caption.txt").write_text(comprehensive_t2i_caption, encoding="utf-8")
-        (output_dir / "caption.json").write_text(
-            json.dumps(caption_json, indent=2, ensure_ascii=False), encoding="utf-8",
+        output_path.write_text(
+            json.dumps(caption_json, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
         )
 
         # Advisory: the SFT loader truncates very long prompts (see _MAX_CAPTION_TOKENS
         # in sft_dataset.py). ~4 chars/token is a rough guide; warn if the serialized
         # JSON looks large so it can be checked against the recipe's max_caption_tokens.
-        approx_tokens = len(json.dumps(caption_json, ensure_ascii=False)) // 4
-        if approx_tokens > 1024:
-            log.warning(
-                f"{name}: structured caption is ~{approx_tokens} tokens (rough estimate); "
-                "ensure the SFT recipe's max_caption_tokens covers it to avoid truncation."
-            )
         log.info("Caption saved for %s after %.1fs: %s", name, time.monotonic() - started, output_dir)
         return True
 
-    log.warning(f"Failed to get caption for {name}")
-    return False
-
-
-async def _process_with_semaphore(
-    args: Args,
-    client: openai.AsyncOpenAI,
-    semaphore: asyncio.Semaphore,
-    name: str,
-    image_ref: str,
-    media_override: dict | None,
-    prompt_template: str,
-    mask_ref: str | None = None,
-) -> bool:
-    async with semaphore:
-        if mask_ref is None:
-            return await _process_single(args, client, name, image_ref, media_override, prompt_template)
-        return await _process_single(
-            args, client, name, image_ref, media_override, prompt_template, mask_ref=mask_ref,
+    try:
+        return await with_retries(
+            f"Caption {name}", _attempt, max_attempts=args.max_retries, delay_s=1.0, server=args.server,
         )
+    except RuntimeError:
+        log.warning("Failed to get caption for %s", name)
+        return False
 
 
 def _read_manifest_entries(input_files: list[Path]) -> list[tuple[str, str, dict | None]]:
@@ -349,16 +258,26 @@ def _collect_image_items(args: Args) -> list[tuple[str, str, dict | None]]:
         items = _read_manifest_entries(args.input_files)
     elif args.image:
         if args.image.is_dir():
-            for vp in sorted(args.image.iterdir()):
+            for vp in sorted(args.image.iterdir(), key=lambda item: (item.name.casefold(), item.name)):
                 if vp.is_file() and vp.suffix.lower() in IMAGE_EXTENSIONS:
                     items.append((vp.stem, str(vp), None))
         elif args.image.is_file():
+            if args.image.suffix.lower() not in IMAGE_EXTENSIONS:
+                raise ValueError(f"Unsupported image format: {args.image.suffix}")
             items.append((args.image.stem, str(args.image), None))
         else:
             raise FileNotFoundError(f"Image path does not exist: {args.image}")
 
     if not items:
         raise ValueError("No image inputs found. Provide --input_files (-if) or --image (-i).")
+    names: set[str] = set()
+    for name, _, _ in items:
+        if name in {".", ".."} or "/" in name or "\\" in name:
+            raise ValueError(f"Image output name must be a filename, received {name!r}.")
+        key = name.casefold()
+        if key in names:
+            raise ValueError(f"Ambiguous original image name: {name!r}; output filenames must be unique.")
+        names.add(key)
     return items
 
 
@@ -415,50 +334,38 @@ async def caption_from_image(args: Args):
     items = _collect_image_items(args)
     mask_refs = _pair_mask_items(args, items)
 
-    client = openai.AsyncOpenAI(
-        api_key="a84be36b570d14855696b9298eeba9b37a1e6bb0977be381ab284e3207ff648d",
-        base_url=args.server,
-        timeout=args.timeout,
-        max_retries=0,
-    )
-    if not args.model:
-        models = await client.models.list()
-        args.model = models.data[0].id
-        log.info(f"Using model: {args.model}")
+    async with create_client(
+        args.server,
+        api_token="a84be36b570d14855696b9298eeba9b37a1e6bb0977be381ab284e3207ff648d",
+        timeout_s=args.timeout,
+    ) as client:
+        if not args.model:
+            args.model = await resolve_model(client, args.model)
+            log.info(f"Using model: {args.model}")
 
-    log.info(
-        "Captioning %s images at %s with model=%s, max_workers=%s, timeout=%ss, max_tokens=%s",
-        len(items), args.server, args.model, args.max_workers, args.timeout, args.max_tokens,
-    )
-    semaphore = asyncio.Semaphore(args.max_workers)
-
-    tasks = [
-        _process_with_semaphore(
-            args=args,
-            client=client,
-            semaphore=semaphore,
-            name=name,
-            image_ref=image_ref,
-            media_override=media,
-            prompt_template=prompt_template,
-            **({"mask_ref": mask_ref} if mask_ref is not None else {}),
+        log.info(
+            "Captioning %s images at %s with model=%s, max_workers=%s, timeout=%ss, max_tokens=%s",
+            len(items), args.server, args.model, args.max_workers, args.timeout, args.max_tokens,
         )
-        for (name, image_ref, media), mask_ref in zip(items, mask_refs)
-    ]
-    n_success = 0
-    for result in tqdm(asyncio.as_completed(tasks), desc="Captioning", total=len(tasks)):
-        if await result:
-            n_success += 1
+        async def process(item: tuple[tuple[str, str, dict | None], str | None]) -> bool:
+            (name, image_ref, media), mask_ref = item
+            return await _process_single(
+                args, client, name, image_ref, media, prompt_template, mask_ref=mask_ref,
+            )
 
-    log.info(f"{n_success}/{len(tasks)} images were successfully captioned")
+        results = await run_batch(
+            list(zip(items, mask_refs)), process, max_workers=args.max_workers,
+            desc="Captioning", unit="image",
+        )
+        log.info("%d/%d images were successfully captioned", sum(results), len(items))
 
 
 def main():
+    args = tyro.cli(Args, description=__doc__)
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    args = tyro.cli(Args, description=__doc__)
     asyncio.run(caption_from_image(args))
 
 

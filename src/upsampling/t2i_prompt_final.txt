@@ -11,7 +11,7 @@ The INPUT SCENE DESCRIPTION is provided as a JSON object containing exactly four
  "lighting": "short description of the illumination conditions, including light source, intensity, direction, shadows",
  "weather": "short description of atmospheric and weather conditions"
 }
-Produce a JSON with the same schema which include the requested changes.
+Produce a JSON with the same schema which include the requested changes, but do NOT submit it. It will be used as reference for PHASE 2
 JSON Schema to complete:
 {
  "foreground": "short description of the main subjects visible in the foreground",
@@ -40,6 +40,7 @@ Requirements:
 - Do not add keys beyond the template. Do not omit keys required by the template.
 - At least a car MUST be described in the output JSON. Every generated scene MUST contain at least one visible passenger car, even when the INPUT SCENE DESCRIPTION does not mention cars. If necessary, naturally introduce cars into the scene. The `subjects` array MUST NEVER be empty. One element MUST explicitly describe either one passenger car or a group of passenger cars. Mentioning cars only in other JSON fields is insufficient. Cars may appear individually or in groups, including moving traffic, queues, traffic jams, parking lots, roadside parking, and distant traffic. They may occupy the foreground, middle ground, background, or multiple depth planes. Describe each clearly distinguishable car individually in `subjects`, specifying its appearance, color, body style, position, size, orientation, and visible characteristics. For dense parking lots, long traffic queues, or distant groups, cars MAY be described collectively, specifying their approximate quantity, arrangement, appearance, and spatial distribution. Encourage substantial variation in the number, placement, scale, visibility, and arrangement of cars. Do NOT systematically favor single cars, close-ups, foreground vehicles, or any particular traffic configuration. Choose the number and arrangement of cars according to the scene. Do not always default to one car. Other vehicle types, such as trucks, service vehicles, pick-ups, buses, motorcycles, vans, planes, train cars and bicycles, do NOT satisfy the mandatory passenger car requirement unless an actual passenger car is also present.
 
+Return only the JSON object wrapped in a ```json code fence.
 JSON Schema to complete:
 $json_template
 
