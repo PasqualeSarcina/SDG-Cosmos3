@@ -38,6 +38,11 @@ class Args(pydantic.BaseModel):
     """Path to a single image file or a directory of images.
     Mutually exclusive with --input_files."""
 
+    mask: Path | None = None
+    """Optional mask file or directory, paired with --image by filename stem.
+    Extensions may differ. Each mask is sent as the second image in its request.
+    Not supported with --input-files."""
+
     output_dir: Annotated[Path, tyro.conf.arg(aliases=("-o",))]
     """Output directory for generated captions."""
 
@@ -48,11 +53,11 @@ class Args(pydantic.BaseModel):
 
     max_workers: int = pydantic.Field(default=16, ge=1)
     """Maximum number of concurrent requests to the API."""
-    max_retries: int = pydantic.Field(default=2, ge=1)
+    max_retries: int = pydantic.Field(default=3, ge=1)
     """Maximum number of attempts for each image, including the first request."""
     max_tokens: int = pydantic.Field(default=4096, ge=1)
     """Maximum output tokens per request; increase if the response is truncated."""
-    timeout: float = pydantic.Field(default=600.0, gt=0)
+    timeout: float = pydantic.Field(default=1200.0, gt=0)
     """Per-request client timeout in seconds; a hung request fails after this and is retried."""
 
     prompt_template_path: Path | None = None
@@ -60,6 +65,9 @@ class Args(pydantic.BaseModel):
 
     debug: bool = False
     """If True, save raw API responses for debugging."""
+
+    raw_content: bool = False
+    """Save message.content verbatim to caption.txt, bypassing structured caption parsing."""
 
 
 def _is_remote_ref(ref: str) -> bool:
@@ -90,17 +98,46 @@ def _image_url(image_ref: str) -> str:
     return f"data:{mime_type};base64,{encoded}"
 
 
-def _build_vlm_messages(image_ref: str, prompt_template: str) -> list[dict]:
-    """Build an OpenAI-compatible multimodal message with an image + text prompt."""
+def _build_vlm_messages(
+    image_ref: str,
+    prompt_template: str,
+    mask_ref: str | None = None,
+) -> list[dict]:
+    """Build one multimodal request, optionally including an original/mask pair."""
+    content = [{"type": "image_url", "image_url": {"url": _image_url(image_ref)}}]
+    if mask_ref is not None:
+        content.append({"type": "image_url", "image_url": {"url": _image_url(mask_ref)}})
+    content.append({"type": "text", "text": prompt_template})
     return [
         {
             "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": _image_url(image_ref)}},
-                {"type": "text", "text": prompt_template},
-            ],
+            "content": content,
         }
     ]
+
+
+def _extract_caption_text(message) -> tuple[str, str | None]:
+    """Recover tagged output misplaced by an OpenAI-compatible reasoning parser.
+
+    Ordinary reasoning without a complete caption is not accepted as output.
+    """
+    text = (message.content or "").strip()
+    if text:
+        return text, None
+    for field in ("reasoning", "reasoning_content"):
+        candidate = getattr(message, field, None)
+        if not isinstance(candidate, str):
+            continue
+        scene = extract_xml_tag(candidate, "scene_draft")
+        narrative = extract_xml_tag(candidate, "comprehensive_t2i_caption")
+        if scene and narrative and parse_structured_caption(candidate) is not None:
+            # Retain only the explicit output sections, not surrounding reasoning.
+            return (
+                f"<scene_draft>{scene}</scene_draft>\n"
+                f"<comprehensive_t2i_caption>{narrative}</comprehensive_t2i_caption>",
+                field,
+            )
+    return "", None
 
 
 async def _process_single(
@@ -110,12 +147,18 @@ async def _process_single(
     image_ref: str,
     media_override: dict | None,
     prompt_template: str,
+    mask_ref: str | None = None,
 ) -> bool:
     assert args.model
 
     output_dir = args.output_dir / name
     try:
-        messages = _build_vlm_messages(image_ref, prompt_template)
+        messages = _build_vlm_messages(
+            image_ref, prompt_template,
+            mask_ref=mask_ref if mask_ref is not None else (
+                str(args.mask) if args.mask is not None and not args.mask.is_dir() else None
+            ),
+        )
     except (OSError, ValueError) as e:
         log.error("Cannot read image %s (%s): %s", name, image_ref, e)
         return False
@@ -128,9 +171,17 @@ async def _process_single(
                 model=args.model,
                 messages=messages,
                 max_tokens=args.max_tokens,
-                temperature=0.7,
-                top_p=0.8,
-                extra_body={"top_k": 20, "min_p": 0.0},
+                temperature=0.7,  #nvfp4 0.7
+                top_p=0.8,      #nvfp4 0.8
+                #extra_body={"top_k": 20, "min_p": 0.0},
+                extra_body={
+                    "top_k": 20,
+                    "presence_penalty": 1.5,
+                    "repetition_penalty": 1.0,
+                    "chat_template_kwargs": {
+                        "enable_thinking": False
+                    }
+                }
             )
         except Exception as e:
             log.warning(
@@ -144,22 +195,35 @@ async def _process_single(
             continue
 
         choice = response.choices[0] if len(response.choices) == 1 else None
-        text = (choice.message.content or "").strip() if choice else ""
-        comprehensive_t2i_caption = extract_xml_tag(text, "comprehensive_t2i_caption")
-        scene_draft = parse_structured_caption(text)
+        if args.raw_content:
+            text = (choice.message.content or "") if choice else ""
+            recovered_field = None
+        else:
+            text, recovered_field = _extract_caption_text(choice.message) if choice else ("", None)
+        if recovered_field:
+            log.warning(
+                "%s: message.content is empty; recovered tagged caption from message.%s. "
+                "Check the server reasoning parser configuration.", name, recovered_field,
+            )
+        comprehensive_t2i_caption = None
+        scene_draft = None
+        if not args.raw_content:
+            comprehensive_t2i_caption = extract_xml_tag(text, "comprehensive_t2i_caption")
+            scene_draft = parse_structured_caption(text)
         failure = None
         if choice is None:
             failure = f"Expected one choice, received {len(response.choices)}"
         elif choice.finish_reason != "stop":
             failure = f"Invalid finish_reason={choice.finish_reason!r} (max_tokens={args.max_tokens})"
-        elif not text:
+        elif not text.strip():
             failure = "Empty response content"
-        elif not comprehensive_t2i_caption:
+        elif not args.raw_content and not comprehensive_t2i_caption:
             failure = "Missing or empty <comprehensive_t2i_caption> tag"
-        elif scene_draft is None:
+        elif not args.raw_content and scene_draft is None:
             failure = "Invalid scene_draft JSON"
 
-        if args.debug or failure:
+        response_path = None
+        if args.debug:
             retry_dir = output_dir / f"{i_retry}"
             retry_dir.mkdir(parents=True, exist_ok=True)
             response_path = retry_dir / "response.json"
@@ -168,9 +232,16 @@ async def _process_single(
             log.warning(
                 "[%s/%s] %s for %s after %.1fs; usage=%s; raw response: %s",
                 i_retry + 1, args.max_retries, failure, name,
-                time.monotonic() - started, response.usage, response_path,
+                time.monotonic() - started, response.usage,
+                response_path or "not saved (enable --debug)",
             )
             continue
+
+        if args.raw_content:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "caption.json").write_text(text, encoding="utf-8")
+            log.info("Caption saved for %s after %.1fs: %s", name, time.monotonic() - started, output_dir)
+            return True
 
         # Media fields: prefer a manifest-provided override; else ffprobe a local
         # file; else leave empty (e.g. a remote URL ffprobe cannot read).
@@ -189,12 +260,10 @@ async def _process_single(
         try:
             caption_json = assemble_caption_json(scene_draft, comprehensive_t2i_caption, media)
         except pydantic.ValidationError as e:
-            response_path = output_dir / str(i_retry) / "response.json"
-            response_path.parent.mkdir(parents=True, exist_ok=True)
-            response_path.write_text(response.model_dump_json(), encoding="utf-8")
             log.warning(
                 "[%s/%s] caption_json failed validation for %s: %s; raw response: %s",
-                i_retry + 1, args.max_retries, name, e, response_path,
+                i_retry + 1, args.max_retries, name, e,
+                response_path or "not saved (enable --debug)",
             )
             continue
 
@@ -229,9 +298,14 @@ async def _process_with_semaphore(
     image_ref: str,
     media_override: dict | None,
     prompt_template: str,
+    mask_ref: str | None = None,
 ) -> bool:
     async with semaphore:
-        return await _process_single(args, client, name, image_ref, media_override, prompt_template)
+        if mask_ref is None:
+            return await _process_single(args, client, name, image_ref, media_override, prompt_template)
+        return await _process_single(
+            args, client, name, image_ref, media_override, prompt_template, mask_ref=mask_ref,
+        )
 
 
 def _read_manifest_entries(input_files: list[Path]) -> list[tuple[str, str, dict | None]]:
@@ -276,7 +350,7 @@ def _collect_image_items(args: Args) -> list[tuple[str, str, dict | None]]:
     elif args.image:
         if args.image.is_dir():
             for vp in sorted(args.image.iterdir()):
-                if vp.suffix.lower() in IMAGE_EXTENSIONS:
+                if vp.is_file() and vp.suffix.lower() in IMAGE_EXTENSIONS:
                     items.append((vp.stem, str(vp), None))
         elif args.image.is_file():
             items.append((args.image.stem, str(args.image), None))
@@ -288,9 +362,50 @@ def _collect_image_items(args: Args) -> list[tuple[str, str, dict | None]]:
     return items
 
 
+def _pair_mask_items(args: Args, items: list[tuple[str, str, dict | None]]) -> list[str | None]:
+    """Resolve all pairs before starting requests; reject missing or ambiguous names."""
+    if args.mask is None:
+        return [None] * len(items)
+    if args.input_files or args.image is None:
+        raise ValueError("--mask requires --image and cannot be used with --input-files.")
+    if args.mask.is_dir():
+        masks = sorted(
+            path for path in args.mask.iterdir()
+            if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+        )
+    elif args.mask.is_file():
+        if args.mask.suffix.lower() not in IMAGE_EXTENSIONS:
+            raise ValueError(f"Unsupported mask format: {args.mask.suffix}")
+        masks = [args.mask]
+    else:
+        raise FileNotFoundError(f"Mask path does not exist: {args.mask}")
+
+    by_stem: dict[str, Path] = {}
+    for mask in masks:
+        key = mask.stem.casefold()
+        if key in by_stem:
+            raise ValueError(f"Ambiguous mask name '{mask.stem}': {by_stem[key]} and {mask}")
+        by_stem[key] = mask
+
+    refs: list[str | None] = []
+    seen: set[str] = set()
+    for _, image_ref, _ in items:
+        stem = Path(image_ref).stem
+        key = stem.casefold()
+        if key in seen:
+            raise ValueError(f"Ambiguous original image name: '{stem}'")
+        seen.add(key)
+        if key not in by_stem:
+            raise ValueError(f"No matching mask for image '{image_ref}' (expected name '{stem}')")
+        refs.append(str(by_stem[key]))
+    return refs
+
+
 async def caption_from_image(args: Args):
     if args.input_files and args.image:
         raise ValueError("Provide either --input_files or --image, not both.")
+    if args.mask is not None and (args.input_files or args.image is None):
+        raise ValueError("--mask requires --image and cannot be used with --input-files.")
 
     if args.prompt_template_path:
         prompt_template = args.prompt_template_path.read_text(encoding="utf-8")
@@ -298,9 +413,10 @@ async def caption_from_image(args: Args):
         prompt_template = (_PACKAGE_DIR / "src/caption/image_captioner.txt").read_text(encoding="utf-8")
 
     items = _collect_image_items(args)
+    mask_refs = _pair_mask_items(args, items)
 
     client = openai.AsyncOpenAI(
-        api_key="EMPTY",
+        api_key="a84be36b570d14855696b9298eeba9b37a1e6bb0977be381ab284e3207ff648d",
         base_url=args.server,
         timeout=args.timeout,
         max_retries=0,
@@ -325,8 +441,9 @@ async def caption_from_image(args: Args):
             image_ref=image_ref,
             media_override=media,
             prompt_template=prompt_template,
+            **({"mask_ref": mask_ref} if mask_ref is not None else {}),
         )
-        for name, image_ref, media in items
+        for (name, image_ref, media), mask_ref in zip(items, mask_refs)
     ]
     n_success = 0
     for result in tqdm(asyncio.as_completed(tasks), desc="Captioning", total=len(tasks)):

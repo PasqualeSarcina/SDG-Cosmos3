@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: OpenMDW-1.1
 
-"""Generate images from a caption JSON file or a directory of caption.json files."""
+"""Generate images from JSON captions (default) or plain text captions."""
 
 import argparse
 import base64
@@ -15,40 +15,55 @@ from PIL import Image
 from tqdm import tqdm
 
 
-def collect_inputs(input_path: Path, output_dir: Path, negative_prompt_path: Path|None = None) ->  tuple[list[tuple[Path, Path]], Path|None] :
+def collect_inputs(input_path: Path, output_dir: Path, negative_prompt_path: Path|None = None, input_format: str = "json") ->  tuple[list[tuple[Path, Path]], Path|None] :
     """Find captions and reject ambiguous output names before inference."""
+    if input_format not in ("json", "txt"):
+        raise ValueError(f"Unsupported input format: {input_format}")
+    suffix = f".{input_format}"
+    format_name = input_format.upper()
     if negative_prompt_path is not None:
-        if negative_prompt_path.is_file():
-            if negative_prompt_path.suffix.lower() != ".json":
-                raise ValueError(f"Expected a JSON file: {negative_prompt_path}")
-        else:
-            raise ValueError(f"Expected a JSON file: {negative_prompt_path}")
+        if not negative_prompt_path.is_file() or negative_prompt_path.suffix.lower() not in (".json", ".txt"):
+            raise ValueError(f"Expected a JSON or TXT file: {negative_prompt_path}")
     if input_path.is_file():
-        if input_path.suffix.lower() != ".json":
-            raise ValueError(f"Expected a JSON file: {input_path}")
+        if input_path.suffix.lower() != suffix:
+            raise ValueError(f"Expected a {format_name} file: {input_path}")
         return [(input_path, output_dir / "image.png")], negative_prompt_path
     if not input_path.is_dir():
         raise ValueError(f"Input path does not exist: {input_path}")
 
-    captions = sorted(path for path in input_path.rglob("caption.json") if path.is_file())
+    negative_path = negative_prompt_path.resolve() if negative_prompt_path is not None else None
+    captions = sorted(
+        path for path in input_path.rglob("*")
+        if path.is_file() and path.suffix.lower() == suffix and path.resolve() != negative_path
+    )
     if not captions:
-        raise ValueError(f"No caption.json files found in {input_path}")
+        raise ValueError(f"No {suffix} files found in {input_path}")
 
     items = []
     names = set()
     for caption in captions:
-        name = f"{caption.parent.name}.png"
+        # Preserve existing output names for the original caption.json/txt layout.
+        name = f"{caption.parent.name if caption.stem.lower() == 'caption' else caption.stem}.png"
         if name.casefold() in names:
-            raise ValueError(f"Duplicate output name {name!r}: caption folders must have unique names")
+            raise ValueError(f"Duplicate output name {name!r}: input files must map to unique output names")
         names.add(name.casefold())
         items.append((caption, output_dir / name))
     return items, negative_prompt_path
 
 
-def generate_image(caption: Path, negative_prompt: Path|None, output: Path, server: str) -> None:
-    prompt = json.dumps(json.loads(caption.read_text(encoding="utf-8-sig")), ensure_ascii=False, separators=(",", ":"))
+def read_prompt(path: Path, input_format: str = "json") -> str:
+    text = path.read_text(encoding="utf-8-sig")
+    if input_format == "txt":
+        return text
+    if input_format == "json":
+        return json.dumps(json.loads(text), ensure_ascii=False, separators=(",", ":"))
+    raise ValueError(f"Unsupported input format: {input_format}")
+
+
+def generate_image(caption: Path, negative_prompt: Path|None, output: Path, server: str, input_format: str = "json") -> None:
+    prompt = read_prompt(caption, input_format)
     if negative_prompt is not None:
-        negative_prompt = json.dumps(json.loads(negative_prompt.read_text(encoding="utf-8-sig")), ensure_ascii=False, separators=(",", ":"))
+        negative_prompt = read_prompt(negative_prompt, negative_prompt.suffix.lower().lstrip("."))
     request = {
         "model_mode": "text2image",
         "prompt": prompt,
@@ -85,11 +100,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "-i", "--input", type=Path, required=True,
-        help="Caption JSON file or directory searched recursively for caption.json",
+        help="Caption file or directory searched recursively for all .json or .txt files according to --format",
+    )
+    parser.add_argument(
+        "--format", dest="input_format", choices=("json", "txt"), default="json",
+        help="Format of captions (default: json)",
     )
     parser.add_argument(
         "--negative-prompt", type=Path, required=False,
-        help="Negative prompt JSON file",
+        help="Negative prompt JSON or TXT file; format detected from its extension independently of --format",
     )
     parser.add_argument("-o", "--output", type=Path, required=True, help="Output directory for PNG images")
     parser.add_argument(
@@ -104,7 +123,7 @@ def main() -> None:
     if args.concurrency < 1:
         parser.error("--concurrency must be at least 1")
     try:
-        items = collect_inputs(args.input, args.output, args.negative_prompt)
+        items = collect_inputs(args.input, args.output, args.negative_prompt, args.input_format)
     except ValueError as exc:
         parser.error(str(exc))
     args.output.mkdir(parents=True, exist_ok=True)
@@ -112,13 +131,13 @@ def main() -> None:
     negative_prompt_path = items[1]
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = {
-            executor.submit(generate_image, caption, negative_prompt_path, output, args.server): (caption, output)
+            executor.submit(generate_image, caption, negative_prompt_path, output, args.server, args.input_format): (caption, output)
             for caption, output in items[0]
         }
         with tqdm(total=len(futures), desc="Generating images", unit="image", disable=not args.input.is_dir()) as progress:
             for future in as_completed(futures):
                 caption, output = futures[future]
-                progress.set_postfix_str(caption.parent.name)
+                progress.set_postfix_str(caption.name)
                 try:
                     future.result()
                 except (OSError, ValueError, KeyError, TypeError, IndexError, requests.RequestException) as exc:
