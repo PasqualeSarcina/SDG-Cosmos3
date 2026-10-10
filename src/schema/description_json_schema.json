@@ -1,0 +1,6 @@
+{
+ "foreground": "short description of the main subjects visible in the foreground",
+ "background": "short description of the background, environment, distant subjects and setting",
+ "lighting": "short description of the illumination conditions, including light source, intensity, direction, shadows",
+ "weather": "short description of atmospheric and weather conditions"
+}

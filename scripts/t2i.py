@@ -143,8 +143,8 @@ def main() -> None:
                 except (OSError, ValueError, KeyError, TypeError, IndexError, requests.RequestException) as exc:
                     failures += 1
                     tqdm.write(f"Failed {caption}: {exc}")
-                else:
-                    tqdm.write(f"Saved image to {output}")
+                #else:
+                #    tqdm.write(f"Saved image to {output}")
                 progress.update(1)
     print(f"Saved {len(items[0]) - failures}/{len(items[0])} images to {args.output}")
     if failures:

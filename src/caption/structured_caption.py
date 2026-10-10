@@ -4,6 +4,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from src.request.response_parsing import parse_json_response
+
 
 class _CaptionModel(BaseModel):
     # Preserve image-specific attributes rather than silently dropping them.
@@ -98,47 +100,6 @@ def extract_xml_tag(text: str, tag: str) -> str | None:
     match = re.search(rf"<{tag}>\s*(.*?)\s*</{tag}>", text, re.DOTALL)
     return match.group(1).strip() if match else None
 
-def _strip_code_fences(text: str) -> str:
-    """Strip a leading ```json / ``` fence and trailing ``` if present."""
-    cleaned = text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```(?:json)?\s*\n?", "", cleaned)
-        cleaned = re.sub(r"\n?```\s*$", "", cleaned)
-    return cleaned.strip()
-
-
-def _first_json_object(text: str) -> str | None:
-    """Return the first balanced ``{...}`` block in ``text``, or ``None``.
-
-    Brace-counting fallback for when the model wraps the JSON in prose without
-    fences/tags.  Ignores braces inside double-quoted strings.
-    """
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_str = False
-    escaped = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if in_str:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None
-
 def parse_structured_caption(text: str) -> dict | None:
     """Extract the Phase-1 ``<scene_draft>`` JSON object from a VLM response.
 
@@ -158,16 +119,12 @@ def parse_structured_caption(text: str) -> dict | None:
     candidates.append(text)
 
     for candidate in candidates:
-        cleaned = _strip_code_fences(candidate)
-        for blob in (cleaned, _first_json_object(cleaned)):
-            if not blob:
-                continue
-            try:
-                parsed = json.loads(blob)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(parsed, dict):
-                return parsed
+        try:
+            parsed = parse_json_response(candidate, allow_prose=True)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
     return None
 
 def aspect_ratio_str(width: int, height: int) -> str:

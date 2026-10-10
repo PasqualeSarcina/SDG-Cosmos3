@@ -22,7 +22,7 @@ def normalize_base_url(url: str) -> str:
     """Accept a host, a /v1 base URL, or a full chat-completions URL."""
     normalized = url.strip().rstrip("/")
     if not normalized:
-        raise ValueError("endpoint_url cannot be empty.")
+        raise ValueError("server cannot be empty.")
     if not normalized.startswith(("http://", "https://")):
         normalized = f"https://{normalized}"
     if normalized.endswith("/chat/completions"):
@@ -32,10 +32,10 @@ def normalize_base_url(url: str) -> str:
     return normalized
 
 
-def create_client(endpoint_url: str, *, api_token: str | None, timeout_s: float) -> AsyncOpenAI:
+def create_client(server: str, *, api_token: str | None, timeout_s: float) -> AsyncOpenAI:
     """Disable SDK retries: callers retry the complete request and validation."""
     return AsyncOpenAI(
-        base_url=normalize_base_url(endpoint_url),
+        base_url=normalize_base_url(server),
         api_key=api_token or "EMPTY",
         timeout=timeout_s,
         max_retries=0,

@@ -17,16 +17,16 @@ CLI arguments.
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
+import tyro
 from openai import AsyncOpenAI
 
 _PACKAGE_DIR = Path(__file__).resolve().parents[1]
@@ -35,6 +35,7 @@ if not __package__:
 
 from src.request.client import chat_completion, create_client, list_models, run_batch, with_retries
 from src.request.response_errors import response_content
+from src.request.response_parsing import parse_json_response
 from src.validation.t2i_schema import t2i_template_to_json_schema
 
 # In Cosmos3 training, we used `json.dumps(...)` for converting dict-structured caption objects to string.
@@ -114,12 +115,23 @@ def build_openai_message(
     }
 
 
+@dataclass(frozen=True)
+class _OutputParameters:
+    resolution: str
+    aspect_ratio: str
+
+    def __post_init__(self) -> None:
+        if self.resolution not in RESOLUTION_RATIO_DICT:
+            raise ValueError(f"Unsupported upsampler resolution {self.resolution!r}.")
+        if self.aspect_ratio not in RESOLUTION_RATIO_DICT[self.resolution]:
+            raise ValueError(
+                f"Unsupported upsampler aspect_ratio {self.aspect_ratio!r} for resolution {self.resolution!r}."
+            )
+
+
 def _apply_t2i_output_parameters(data: dict[str, Any], *, resolution: str, aspect_ratio: str) -> dict[str, Any]:
     """Force canonical image metadata into an upsampled T2I JSON object."""
-    if resolution not in RESOLUTION_RATIO_DICT:
-        raise ValueError(f"Unsupported upsampler resolution {resolution!r}.")
-    if aspect_ratio not in RESOLUTION_RATIO_DICT[resolution]:
-        raise ValueError(f"Unsupported upsampler aspect_ratio {aspect_ratio!r} for resolution {resolution!r}.")
+    _OutputParameters(resolution, aspect_ratio)
     resolution_pair = RESOLUTION_RATIO_DICT[resolution][aspect_ratio]
     data["resolution"] = {"H": resolution_pair["H"], "W": resolution_pair["W"]}
     data["aspect_ratio"] = aspect_ratio
@@ -130,13 +142,13 @@ def _apply_t2i_output_parameters(data: dict[str, Any], *, resolution: str, aspec
 class PromptUpsamplerConfig:
     """Connection and sampling settings for ``PromptUpsamplerClient``.
 
-    ``endpoint_url`` may be a bare host, a ``/v1`` base URL, or a full
+    ``server`` may be a bare host, a ``/v1`` base URL, or a full
     ``/chat/completions`` URL; it is normalized by the client. Sampling
     parameters set to ``None`` are omitted from the request payload so the same
     client can work across gateways with different accepted knobs.
     """
 
-    endpoint_url: str
+    server: str
     model: str | None
     api_token: str | None
     timeout_s: float
@@ -145,6 +157,20 @@ class PromptUpsamplerConfig:
     temperature: float | None
     top_p: float | None
     system_prompt_path: str | Path | None = None
+    system_prompt: str = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.server.strip():
+            raise ValueError("--server cannot be empty.")
+        if not self.timeout_s > 0:
+            raise ValueError("--timeout-s must be > 0.")
+        for option in ("max_tokens", "max_retries"):
+            if getattr(self, option) < 1:
+                raise ValueError(f"--{option.replace('_', '-')} must be >= 1.")
+        system_path = Path(self.system_prompt_path or PROMPTING_TEMPLATES_DIR / "t2i_system_upsampler_prompt.txt")
+        self.system_prompt = system_path.read_text(encoding="utf-8-sig").strip()
+        if not self.system_prompt:
+            raise ValueError(f"System prompt file is empty: {system_path}")
 
 
 class PromptUpsamplerClient:
@@ -152,14 +178,11 @@ class PromptUpsamplerClient:
 
     def __init__(self, config: PromptUpsamplerConfig, *, client: AsyncOpenAI | None = None) -> None:
         self.config = config
-        system_path = Path(config.system_prompt_path or PROMPTING_TEMPLATES_DIR / "t2i_system_upsampler_prompt.txt")
         json_schema_path = SRC_DIR / "schema" / "t2i_json_schema.json"
-        self.system_prompt = system_path.read_text(encoding="utf-8-sig").strip()
-        if not self.system_prompt:
-            raise ValueError(f"System prompt file is empty: {system_path}")
+        self.system_prompt = config.system_prompt
         self.json_schema = t2i_template_to_json_schema(json.loads(json_schema_path.read_text(encoding="utf-8-sig")))
         self._client = client or create_client(
-            config.endpoint_url, api_token=config.api_token, timeout_s=config.timeout_s,
+            config.server, api_token=config.api_token, timeout_s=config.timeout_s,
         )
         self._owns_client = client is None
         self._model_lock = asyncio.Lock()
@@ -177,7 +200,7 @@ class PromptUpsamplerClient:
 
         return await with_retries(
             "List models", call, max_attempts=self.config.max_retries,
-            delay_s=1.0, backoff=2.0, server=self.config.endpoint_url,
+            delay_s=1.0, backoff=2.0, server=self.config.server,
         )
 
     async def upsample(
@@ -208,7 +231,7 @@ class PromptUpsamplerClient:
 
         return await with_retries(
             "Prompt upsampling", _call, max_attempts=self.config.max_retries,
-            delay_s=1.0, backoff=2.0, server=self.config.endpoint_url,
+            delay_s=1.0, backoff=2.0, server=self.config.server,
         )
 
     async def _get_model(self) -> str:
@@ -233,7 +256,9 @@ class PromptUpsamplerClient:
                 parameters[name] = value
         response = await chat_completion(self._client, response_path=response_path, **parameters)
         content = response_content(response, max_tokens=self.config.max_tokens, response_path=response_path)
-        data = json.loads(content)
+        data = parse_json_response(content)
+        if not isinstance(data, dict):
+            raise ValueError("Prompt upsampling response must be a JSON object.")
         subject_details: dict[str, str] = {}
         for entry in data["subject_details"]:
             key = entry["key"]
@@ -244,39 +269,46 @@ class PromptUpsamplerClient:
         return data
 
 
-def _read_prompts(path: str | Path) -> list[tuple[Path, str]]:
-    """Read one JSON object per .json file, in filename order.
+@dataclass
+class _PromptInputs:
+    """Validate and load immediate JSON inputs before making requests."""
 
-    Directory inputs include only immediate .json files. Validate every input
-    before making requests.
-    """
-    source = Path(path)
-    if source.is_file():
-        if source.suffix.lower() != ".json":
-            raise ValueError(f"Expected a .json file: {source}")
-        files = [source]
-    elif source.is_dir():
-        files = sorted(
-            (item for item in source.iterdir() if item.is_file() and item.suffix.lower() == ".json"),
-            key=lambda item: (item.name.casefold(), item.name),
-        )
-        if not files:
-            raise ValueError(f"No .json files found in {source}.")
-    else:
-        raise ValueError(f"Input path does not exist: {source}")
-    prompts = []
-    for file in files:
-        prompt = file.read_text(encoding="utf-8-sig")
-        if not prompt.strip():
-            raise ValueError(f"Prompt file is empty: {file}")
-        try:
-            data = json.loads(prompt)
-        except ValueError as exc:
-            raise ValueError(f"Invalid JSON in {file}: {exc}") from exc
-        if not isinstance(data, dict):
-            raise ValueError(f"Input JSON must be an object: {file}")
-        prompts.append((file, prompt))
-    return prompts
+    path: str | Path
+    prompts: list[tuple[Path, str]] = field(init=False)
+
+    def __post_init__(self) -> None:
+        source = Path(self.path)
+        if source.is_file():
+            if source.suffix.lower() != ".json":
+                raise ValueError(f"Expected a .json file: {source}")
+            files = [source]
+        elif source.is_dir():
+            files = sorted(
+                (item for item in source.iterdir() if item.is_file() and item.suffix.lower() == ".json"),
+                key=lambda item: (item.name.casefold(), item.name),
+            )
+            if not files:
+                raise ValueError(f"No .json files found in {source}.")
+        else:
+            raise ValueError(f"Input path does not exist: {source}")
+        prompts = []
+        for file in files:
+            prompt = file.read_text(encoding="utf-8-sig")
+            if not prompt.strip():
+                raise ValueError(f"Prompt file is empty: {file}")
+            try:
+                data = json.loads(prompt)
+            except ValueError as exc:
+                raise ValueError(f"Invalid JSON in {file}: {exc}") from exc
+            if not isinstance(data, dict):
+                raise ValueError(f"Input JSON must be an object: {file}")
+            prompts.append((file, prompt))
+        self.prompts = prompts
+
+
+def _read_prompts(path: str | Path) -> list[tuple[Path, str]]:
+    """Read JSON prompts validated by the input dataclass."""
+    return _PromptInputs(path).prompts
 
 
 def _optional_float(value: str) -> float | None:
@@ -296,14 +328,16 @@ async def upsample_prompt_file(
         aspect_ratio: str,
         max_workers: int,
         debug: bool,
+        prompts: list[tuple[Path, str]] | None = None,
 ) -> list[dict[str, Any]]:
     """Upsample a .json file or directory into structured .json captions.
 
     Only immediate .json files are read from directory inputs. Outputs retain
     the exact input filenames and contain the structured caption object directly.
     Raw debug responses share the output/debug directory, with one file per attempt.
+    The CLI supplies preloaded, validated prompts from its argument dataclass.
     """
-    prompts = _read_prompts(input_path)
+    prompts = _read_prompts(input_path) if prompts is None else prompts
     output = Path(output_path)
     output.mkdir(parents=True, exist_ok=True)
     debug_dir = output / "debug" if debug else None
@@ -337,77 +371,88 @@ async def upsample_prompt_file(
     return [result for result in results if result is not None]
 
 
-def build_cli_parser() -> argparse.ArgumentParser:
-    """Build the standalone CLI parser for batch prompt upsampling."""
-    parser = argparse.ArgumentParser(description="Upsample .json files into Cosmos3 text-to-image JSON prompts.")
-    parser.add_argument("--input", required=True,
-                        help="Single .json file or directory containing .json files; subdirectories are ignored. Each file must contain one JSON object.")
-    parser.add_argument("--output", required=True,
-                        help="Output directory; each JSON keeps the exact input filename.")
-    parser.add_argument(
-        "--server",
-        required=True,
-        help="OpenAI-compatible endpoint URL.",
-    )
-    parser.add_argument(
-        "--model",
-        help="Model name. If omitted, use the first model returned by the endpoint.",
-    )
-    parser.add_argument(
-        "--api-token",
-        help="API token.",
-    )
-    parser.add_argument(
-        "--system-prompt",
-        help="UTF-8 text file for the system message. Defaults to src/upsampling/t2i_system_upsampler_prompt.txt.",
-    )
-    parser.add_argument(
-        "--additional-instruction",
-        type=str,
-        default=""
-    )
-    parser.add_argument("--resolution", default="720", choices=sorted(RESOLUTION_RATIO_DICT), help="Resolution tier.")
-    parser.add_argument("--aspect-ratio", default="16,9", help="Aspect ratio key, e.g. 16,9, 9,16, or 1,1.")
-    parser.add_argument("--timeout-s", type=float, default=300.0, help="Request timeout in seconds.")
-    parser.add_argument("--max-tokens", type=int, default=2048, help="Maximum response tokens.")
-    parser.add_argument("--max-retries", type=int, default=10, help="Prompt upsampling retries per prompt.")
-    parser.add_argument("--max-workers", "--max_workers", type=int, default=16,
-                        help="Maximum parallel requests")
-    parser.add_argument(
-        "--temperature", type=_optional_float, default=None, help="Optional sampling temperature, or 'none'."
-    )
-    parser.add_argument("--top-p", type=_optional_float, default=None, help="Optional sampling top-p, or 'none'.")
-    parser.add_argument(
-        "--debug", action="store_true",
-        help="Enable debug logging and save raw API responses to <output>/debug/<input-stem>.attempt-<attempt>.json (attempts start at 0).",
-    )
-    return parser
+OptionalFloat = Annotated[
+    float | None,
+    tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="FLOAT|None",
+        instance_from_str=lambda values: _optional_float(values[0]),
+        is_instance=lambda value: value is None or isinstance(value, float),
+        str_from_instance=lambda value: [str(value)],
+    ),
+]
+
+
+@dataclass
+class Args:
+    """Upsample .json files into Cosmos3 text-to-image JSON prompts."""
+
+    input: Annotated[Path, tyro.conf.arg(aliases=["-i"])]
+    """Single .json file or directory of JSON objects; subdirectories are ignored."""
+    output: Annotated[Path, tyro.conf.arg(aliases=["-o", "--output_dir"])]
+    """Output directory; each JSON keeps the exact input filename."""
+    server: str
+    """OpenAI-compatible endpoint URL."""
+    model: str | None = None
+    """Model name. If omitted, use the first model returned by the endpoint."""
+    api_token: str | None = None
+    """API token."""
+    system_prompt: Path | None = None
+    """UTF-8 system message file. Defaults to src/upsampling/t2i_system_upsampler_prompt.txt."""
+    additional_instruction: str = ""
+    """Additional user instructions."""
+    resolution: str = "720"
+    """Resolution tier."""
+    aspect_ratio: str = "16,9"
+    """Aspect ratio key, e.g. 16,9, 9,16, or 1,1."""
+    timeout_s: float = 1200.0
+    """Request timeout in seconds."""
+    max_tokens: int = 8192
+    """Maximum response tokens."""
+    max_retries: int = 10
+    """Prompt upsampling attempts per prompt."""
+    max_workers: Annotated[int, tyro.conf.arg(aliases=["--max_workers"])] = 16
+    """Maximum parallel requests."""
+    temperature: OptionalFloat = None
+    """Optional sampling temperature; 'none' or 'null' omits it."""
+    top_p: OptionalFloat = None
+    """Optional sampling top-p; 'none' or 'null' omits it."""
+    debug: bool = False
+    """Enable debug logging and save raw API responses to <output>/debug/."""
+    config: PromptUpsamplerConfig = field(init=False, repr=False)
+    prompts: list[tuple[Path, str]] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.max_workers < 1:
+            raise ValueError("--max-workers must be >= 1.")
+        _OutputParameters(self.resolution, self.aspect_ratio)
+        self.input = Path(self.input)
+        self.output = Path(self.output)
+        if self.output.exists() and not self.output.is_dir():
+            raise ValueError(f"Output path must be a directory: {self.output}")
+        self.config = PromptUpsamplerConfig(
+            server=self.server,
+            model=self.model,
+            api_token=self.api_token,
+            timeout_s=self.timeout_s,
+            max_tokens=self.max_tokens,
+            max_retries=self.max_retries,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            system_prompt_path=self.system_prompt,
+        )
+        self.prompts = _read_prompts(self.input)
 
 
 def cli_main(argv: list[str] | None = None) -> int:
     """CLI entry point used by ``python scripts/prompt_upsampling.py``."""
-    parser = build_cli_parser()
-    args = parser.parse_args(argv)
+    args = tyro.cli(Args, args=argv)
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+    for logger_name in ("httpx", "httpx2"):
+        logging.getLogger(logger_name).setLevel(logging.DEBUG if args.debug else logging.WARNING)
 
-    if args.max_workers < 1:
-        parser.error("--max-workers must be >= 1.")
-
-    # Build the client after CLI validation so endpoint/model/token mistakes
-    # fail before any input file is processed.
-    config = PromptUpsamplerConfig(
-        endpoint_url=args.server,
-        model=args.model,
-        api_token=args.api_token,
-        timeout_s=args.timeout_s,
-        max_tokens=args.max_tokens,
-        max_retries=args.max_retries,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        system_prompt_path=args.system_prompt,
-    )
     async def run() -> list[dict[str, Any]]:
-        async with PromptUpsamplerClient(config) as client:
+        async with PromptUpsamplerClient(args.config) as client:
             return await upsample_prompt_file(
                 client,
                 additional_instruction=args.additional_instruction,
@@ -417,6 +462,7 @@ def cli_main(argv: list[str] | None = None) -> int:
                 aspect_ratio=args.aspect_ratio,
                 max_workers=args.max_workers,
                 debug=args.debug,
+                prompts=args.prompts,
             )
 
     results = asyncio.run(run())
