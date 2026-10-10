@@ -14,8 +14,11 @@ import requests
 from PIL import Image
 from tqdm import tqdm
 
+_PACKAGE_DIR = Path(__file__).resolve().parents[1]
 
-def collect_inputs(input_path: Path, output_dir: Path, negative_prompt_path: Path|None = None, input_format: str = "json") ->  tuple[list[tuple[Path, Path]], Path|None] :
+
+def collect_inputs(input_path: Path, output_dir: Path, negative_prompt_path: Path | None = None,
+                   input_format: str = "json") -> tuple[list[tuple[Path, Path]], Path | None]:
     """Find captions and reject ambiguous output names before inference."""
     if input_format not in ("json", "txt"):
         raise ValueError(f"Unsupported input format: {input_format}")
@@ -60,7 +63,8 @@ def read_prompt(path: Path, input_format: str = "json") -> str:
     raise ValueError(f"Unsupported input format: {input_format}")
 
 
-def generate_image(caption: Path, negative_prompt: Path|None, output: Path, server: str, input_format: str = "json") -> None:
+def generate_image(caption: Path, negative_prompt: Path | None, output: Path, server: str,
+                   input_format: str = "json") -> None:
     prompt = read_prompt(caption, input_format)
     if negative_prompt is not None:
         negative_prompt = read_prompt(negative_prompt, negative_prompt.suffix.lower().lstrip("."))
@@ -70,10 +74,10 @@ def generate_image(caption: Path, negative_prompt: Path|None, output: Path, serv
         "negative_prompt": negative_prompt if negative_prompt is not None else "",
         "resolution": "720",
         "num_frames": 1,
-        #"fps": 24.0,
-        #"num_inference_steps": 50,
-        #"guidance_scale": 4,
-        #"flow_shift": 3.0,
+        # "fps": 24.0,
+        # "num_inference_steps": 50,
+        # "guidance_scale": 4,
+        # "flow_shift": 3.0,
         "seed": 2026,
     }
     # print(f"negative_prompt_chars={len(request['negative_prompt'])}")
@@ -108,11 +112,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--negative-prompt", type=Path, required=False,
+        default=Path(_PACKAGE_DIR / "src" / "schema", "negative_prompt_t2i.json"),
         help="Negative prompt JSON or TXT file; format detected from its extension independently of --format",
     )
     parser.add_argument("-o", "--output", type=Path, required=True, help="Output directory for PNG images")
     parser.add_argument(
-        "--server", default="http://localhost:8000",
+        "--server",
         help="Generator server URL without /v1 (default: http://localhost:8000)",
     )
     parser.add_argument(
@@ -131,10 +136,12 @@ def main() -> None:
     negative_prompt_path = items[1]
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
         futures = {
-            executor.submit(generate_image, caption, negative_prompt_path, output, args.server, args.input_format): (caption, output)
+            executor.submit(generate_image, caption, negative_prompt_path, output, args.server, args.input_format): (
+                caption, output)
             for caption, output in items[0]
         }
-        with tqdm(total=len(futures), desc="Generating images", unit="image", disable=not args.input.is_dir()) as progress:
+        with tqdm(total=len(futures), desc="Generating images", unit="image",
+                  disable=not args.input.is_dir()) as progress:
             for future in as_completed(futures):
                 caption, output = futures[future]
                 progress.set_postfix_str(caption.name)
@@ -143,7 +150,7 @@ def main() -> None:
                 except (OSError, ValueError, KeyError, TypeError, IndexError, requests.RequestException) as exc:
                     failures += 1
                     tqdm.write(f"Failed {caption}: {exc}")
-                #else:
+                # else:
                 #    tqdm.write(f"Saved image to {output}")
                 progress.update(1)
     print(f"Saved {len(items[0]) - failures}/{len(items[0])} images to {args.output}")
