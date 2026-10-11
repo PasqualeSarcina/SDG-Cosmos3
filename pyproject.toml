@@ -10,3 +10,23 @@ dependencies = [
     "tqdm>=4.70.1",
     "tyro>=1.0.16",
 ]
+
+[dependency-groups]
+llm-lora = [
+    "accelerate",
+    "bitsandbytes",
+    "causal-conv1d==1.6.0 ; sys_platform == 'linux'",
+    "datasets==4.8.5",
+    "einops",
+    "hf-transfer",
+    "ninja",
+    "packaging",
+    "peft>=0.18.0",
+    "setuptools",
+    "transformers>=5.2,<5.18",
+    "trl==1.13.0",
+    "unsloth",
+    "unsloth-zoo",
+    "wandb",
+    "wheel",
+]

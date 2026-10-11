@@ -1,0 +1,9 @@
+.venv/
+.git/
+.idea/
+__pycache__/
+*.pyc
+.env
+.env.*
+checkpoints/
+outputs/
