@@ -4,8 +4,6 @@ import logging
 import sys
 import time
 
-from PIL import Image
-
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated
@@ -19,13 +17,9 @@ if not __package__:
     # Direct execution puts scripts/ on sys.path, not the project root.
     sys.path.insert(0, str(_PACKAGE_DIR))
 
-from src.caption.structured_caption import extract_xml_tag, parse_structured_caption, media_fields_from_metadata, \
-    assemble_caption_json
-
 from src.request.client import chat_completion, create_client, resolve_model, run_batch, with_retries
 from src.request.response_errors import response_content
 from src.request.response_parsing import parse_json_response
-from src.validation.t2i_schema import t2i_template_to_json_schema
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"]
 log = logging.getLogger(__name__)
@@ -49,19 +43,16 @@ class Args:
     """Maximum concurrent requests."""
     max_retries: Annotated[int, tyro.conf.arg(aliases=["--max_retries"])] = 3
     """Maximum attempts per image, including the first request."""
-    max_tokens: Annotated[int, tyro.conf.arg(aliases=["--max_tokens"])] = 8192
+    max_tokens: Annotated[int, tyro.conf.arg(aliases=["--max_tokens"])] = 10240
     """Maximum output tokens per request."""
     timeout: float = 1200.0
     """Per-request timeout in seconds."""
     prompt_template_path: Annotated[Path | None, tyro.conf.arg(aliases=["--prompt_template_path"])] = None
-    """UTF-8 prompt template file. Defaults to src/caption/image_captioner.txt."""
+    """UTF-8 prompt template file. Defaults to src/templates/simple_captioner.txt."""
     debug: bool = False
     """Enable debug logging and save complete API responses to <output-dir>/debug/."""
-    enforce_cosmos_format: Annotated[bool, tyro.conf.arg(aliases=["--enforce_cosmos_format"])] = True
-    """Validate the Cosmos caption format; disable to require description_json_schema JSON."""
     image_items: list[tuple[str, str]] = field(init=False, repr=False)
     prompt_template: str = field(init=False, repr=False)
-    response_format: dict | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self) -> None:
         for option in ("max_workers", "max_retries", "max_tokens"):
@@ -99,21 +90,10 @@ class Args:
             names.add(key)
         self.image_items = items
 
-        template_path = Path(self.prompt_template_path or _PACKAGE_DIR / "src/caption/image_captioner.txt")
+        template_path = Path(self.prompt_template_path or _PACKAGE_DIR / "src/templates/simple_captioner.txt")
         self.prompt_template = template_path.read_text(encoding="utf-8")
         if not self.prompt_template.strip():
             raise ValueError(f"Prompt template file is empty: {template_path}")
-        if not self.enforce_cosmos_format:
-            schema_path = _PACKAGE_DIR / "src/schema/description_json_schema.json"
-            template = json.loads(schema_path.read_text(encoding="utf-8-sig"))
-            self.response_format = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "image_description",
-                    "strict": True,
-                    "schema": t2i_template_to_json_schema(template),
-                },
-            }
 
 
 def _image_url(image_ref: str) -> str:
@@ -164,67 +144,56 @@ async def _process_single(
         log.error("Cannot read image %s (%s): %s", name, image_ref, e)
         return False
 
+    schema_path = _PACKAGE_DIR / "src/schema/description_json_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8-sig"))
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "image_description",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
     async def _attempt(i_retry: int) -> bool:
         started = time.monotonic()
         log.debug("[%s/%s] Sending image %s", i_retry + 1, args.max_retries, name)
         response_path = output_dir / "debug" / f"{name}.attempt-{i_retry}.json" if args.debug else None
         response = await chat_completion(
-            client, response_path=response_path,
+            client,
+            response_path=response_path,
             model=args.model,
             messages=messages,
             max_tokens=args.max_tokens,
-            **({"response_format": args.response_format} if args.response_format is not None else {}),
+            temperature=0.7,
+            top_p=0.8,
+            presence_penalty=1.5,
+            response_format=response_format,
             extra_body={
+                "top_k": 20,
                 "chat_template_kwargs": {
                     "enable_thinking": False
                 }
             }
         )
         text = response_content(response, max_tokens=args.max_tokens, response_path=response_path)
-        comprehensive_t2i_caption = None
-        scene_draft = None
-        if args.enforce_cosmos_format:
-            comprehensive_t2i_caption = extract_xml_tag(text, "comprehensive_t2i_caption")
-            scene_draft = parse_structured_caption(text)
-            if comprehensive_t2i_caption is None and scene_draft is not None:
-                if extract_xml_tag(text, "scene_draft") is None:
-                    comprehensive_t2i_caption = scene_draft.get("comprehensive_t2i_caption")
-            if not isinstance(comprehensive_t2i_caption, str) or not comprehensive_t2i_caption.strip():
-                raise ValueError("Missing or empty <comprehensive_t2i_caption> tag or JSON field")
-            if scene_draft is None:
-                raise ValueError("Invalid scene_draft JSON")
-
-        if not args.enforce_cosmos_format:
-            data = parse_json_response(text)
-            schema = args.response_format["json_schema"]["schema"]
-            if not isinstance(data, dict) or set(data) != set(schema["required"]):
-                raise ValueError("Caption response must contain exactly the description schema fields.")
-            if any(not isinstance(value, str) for value in data.values()):
-                raise ValueError("Description schema fields must be strings.")
-            output_text = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(output_text, encoding="utf-8")
-            log.debug("Caption saved for %s after %.1fs: %s", name, time.monotonic() - started, output_dir)
-            return True
-
-        try:
-            with Image.open(image_ref) as image:
-                media = media_fields_from_metadata(image.size)
-        except Exception as e:  # noqa: BLE001 - degrade gracefully, keep the caption
-            log.warning(f"Cannot read image dimensions for {name}: {e}; writing caption_json without media fields")
-            media = {}
-
-        caption_json = assemble_caption_json(scene_draft, comprehensive_t2i_caption, media)
-
+        data = parse_json_response(text)
+        if not isinstance(data, dict) or set(data) != set(schema["required"]):
+            raise ValueError("Caption response must contain exactly the description schema fields.")
+        if any(not isinstance(value, str) for key, value in data.items() if key != "cars"):
+            raise ValueError("Description fields other than cars must be strings.")
+        cars = data["cars"]
+        if not isinstance(cars, list) or any(
+            not isinstance(car, dict) or set(car) != {"visibility"}
+            or not isinstance(car["visibility"], str)
+            for car in cars
+        ):
+            raise ValueError("cars must be a list of objects containing a visibility string.")
+        data["cars_count"] = len(cars)
         output_dir.mkdir(parents=True, exist_ok=True)
-
         output_path.write_text(
-            json.dumps(caption_json, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+            json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
         )
-
-        # Advisory: the SFT loader truncates very long prompts (see _MAX_CAPTION_TOKENS
-        # in sft_dataset.py). ~4 chars/token is a rough guide; warn if the serialized
-        # JSON looks large so it can be checked against the recipe's max_caption_tokens.
         log.debug("Caption saved for %s after %.1fs: %s", name, time.monotonic() - started, output_dir)
         return True
 
@@ -237,7 +206,8 @@ async def _process_single(
         return False
 
 
-async def caption_from_image(args: Args):
+async def caption_from_image(args: Args) -> list[tuple[str, str]]:
+    """Caption inputs and return the requests still failed after optional retries."""
     prompt_template = args.prompt_template
 
     items = args.image_items
@@ -261,11 +231,30 @@ async def caption_from_image(args: Args):
                 args, client, name, image_ref, prompt_template,
             )
 
-        results = await run_batch(
-            items, process, max_workers=args.max_workers,
-            desc="Captioning", unit="image",
-        )
-        log.info("%d/%d images were successfully captioned", sum(results), len(items))
+        failed_requests = list(items)
+        while True:
+            results = await run_batch(
+                failed_requests, process, max_workers=args.max_workers,
+                desc="Captioning", unit="image",
+            )
+            failed_requests = [
+                item for item, success in zip(failed_requests, results, strict=True) if not success
+            ]
+            log.info("%d/%d images were successfully captioned", len(items) - len(failed_requests), len(items))
+            print(f"Permanently failed requests: {len(failed_requests)}")
+            if len(failed_requests) <= 1:
+                break
+            try:
+                answer = await asyncio.to_thread(
+                    input, "Retry all failed requests? [y/N]: ",
+                )
+            except (EOFError, OSError):
+                # Non-interactive runs may have closed or unavailable stdin.
+                break
+            if answer.strip().casefold() not in {"y", "yes"}:
+                break
+
+        return failed_requests
 
 
 def cli_main(argv: list[str] | None = None) -> int:

@@ -8,6 +8,10 @@ from openai.types.chat import ChatCompletion
 log = logging.getLogger(__name__)
 
 
+class EmptyResponseError(ValueError):
+    """A completed chat response has no final answer text."""
+
+
 def response_content(
     response: ChatCompletion, *, max_tokens: int, response_path: Path | None = None,
 ) -> str:
@@ -38,6 +42,8 @@ def response_content(
     if getattr(message, "refusal", None):
         raise ValueError(f"Chat completion refused: {message.refusal} ({details}).")
     content = getattr(message, "content", None)
+    if content is None or (isinstance(content, str) and not content.strip()):
+        raise EmptyResponseError(f"Chat completion message content is empty or unsupported ({details}).")
     if not isinstance(content, str) or not content.strip():
         raise ValueError(f"Chat completion message content is empty or unsupported ({details}).")
     return content

@@ -1,6 +1,45 @@
 {
- "foreground": "short description of the main subjects visible in the foreground",
- "background": "short description of the background, environment, distant subjects and setting",
- "lighting": "short description of the illumination conditions, including light source, intensity, direction, shadows",
- "weather": "short description of atmospheric and weather conditions"
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "foreground": {
+      "type": "string",
+      "description": "Short description of the main subjects visible in the foreground."
+    },
+    "background": {
+      "type": "string",
+      "description": "Short description of the background, environment, distant subjects and setting."
+    },
+    "lighting": {
+      "type": "string",
+      "description": "Short description of the illumination conditions, including light source, intensity, direction and shadows."
+    },
+    "weather": {
+      "type": "string",
+      "description": "Short description of atmospheric and weather conditions."
+    },
+    "cars": {
+      "type": "array",
+      "description": "Cars visible in the image. Use an empty array if no cars are visible.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "visibility": {
+            "type": "string",
+            "description": "Description of the car's visibility, considering both occlusion and truncation.",
+            "examples": [
+              "Fully visible",
+              "Partially occluded",
+              "Severely truncated",
+              "Slightly occluded and partially truncated"
+            ]
+          }
+        },
+        "required": ["visibility"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["foreground", "background", "lighting", "weather", "cars"],
+  "additionalProperties": false
 }

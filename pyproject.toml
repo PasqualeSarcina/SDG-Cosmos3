@@ -3,10 +3,12 @@ name = "sdg-cosmos3"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
+    "jsonschema>=4.23",
     "openai>=3.28.0",
     "pillow>=12.3.0",
     "pydantic>=2.14.0",
     "requests>=2.34.2",
+    "scipy-stubs~=1.18.1",
     "tqdm>=4.70.1",
     "tyro>=1.0.16",
 ]

@@ -86,6 +86,7 @@ async def with_retries(
     delay_s: float,
     backoff: float = 1.0,
     server: str | None = None,
+    retry_if: Callable[[Exception], bool] | None = None,
 ) -> R:
     """Retry a complete operation, including its output validation."""
     if max_attempts < 1:
@@ -99,9 +100,9 @@ async def with_retries(
                 operation, exc, attempt=attempt, max_attempts=max_attempts,
                 elapsed_s=time.monotonic() - started, server=server,
             )
-            if attempt + 1 == max_attempts:
+            if attempt + 1 == max_attempts or (retry_if is not None and not retry_if(exc)):
                 raise RuntimeError(
-                    f"{operation} failed after {max_attempts} attempts: {exc}"
+                    f"{operation} failed after {attempt + 1} attempts: {exc}"
                 ) from exc
             await asyncio.sleep(delay_s * backoff ** attempt)
     raise AssertionError("Unreachable")
