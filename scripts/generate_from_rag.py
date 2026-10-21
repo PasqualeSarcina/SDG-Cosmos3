@@ -185,7 +185,7 @@ def cli_main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, default=Path("description_json"), help="RAG description_json directory (recursive).")
     parser.add_argument("--output", required=True, type=Path, help="New or empty directory for Cosmos JSONs.")
-    parser.add_argument("--examples-per-prompt", "--examples", "-n", type=int, default=3, help="N reference examples per scene (default: 3).")
+    parser.add_argument("--examples-per-prompt", "--examples", "-n", type=int, default=10, help="N reference examples per scene (default: 3).")
     parser.add_argument("--number", type=int, default=1, help="Number of new Cosmos scenes (default: 1).")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--max-workers", "--max_workers", type=int, default=4)
