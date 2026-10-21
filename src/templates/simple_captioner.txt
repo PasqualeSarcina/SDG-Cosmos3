@@ -4,19 +4,15 @@ Every image contains at least a car. Do not invent cars or count vehicles that c
 
 Response format: Please organize your answers in the following JSON format:
 {
- "foreground": "short description of the main subjects visible in the foreground",
- "background": "short description of the background, environment, distant subjects and setting",
- "lighting": "short description of the illumination conditions, including light source, intensity, direction, shadows",
- "weather": "short description of atmospheric and weather conditions",
- "cars": [
-    {
-        "visibility": Description of the car's visibility, considering both occlusion and truncation (e.g., 'Fully visible', 'Partially occluded', 'Severely truncated', 'Slightly occluded and partially truncated')
-    }
- ]
+ "foreground": "detailed description of the main subjects visible in the foreground",
+ "background": "detailed description of the background, environment, distant subjects and setting. Sky is NOT part of the background",
+ "lighting": "description of the illumination conditions, including light source, intensity, direction, shadows. Must be one of 'Direct sunlight with sharp shadows', 'Soft, diffuse natural light with subtle shadows', 'Faint natural light', 'Artificial light sources', 'Combination of natural and artificial light', 'Nighttime with little or no ambient light'",
+ "weather": "description of atmospheric and weather conditions. Must be one of 'Clear, with little or no cloud cover', 'Partly cloudy, with patches of clear sky', 'Overcast, with extensive cloud cover', 'Rainy, with rain falling', 'Snowy, with snow falling', 'Foggy, with reduced visibility'",
+ "cars_visibility": [ Description of the car's visibility, considering both occlusion and truncation (e.g., 'Fully visible', 'Partially occluded', 'Severely truncated', 'Slightly occluded and partially truncated'). In case of occlusion also describe what is causing the occlusion.]
 }
 
 Constraints:
-The cars field in the JSON is a list of ALL the cars that can be observed. For each car, independently assess its occlusion and truncation, then summarize both in the visibility field. If neither applies, use "Fully visible". Avoid grouping individually distinguishable cars using phrases such as "multiple cars".
+The cars_visibility field in the JSON is a list of ALL the cars that can be observed. For each car, independently assess its occlusion and truncation, then summarize both in the field. If neither applies, use "Fully visible". Avoid grouping individually distinguishable cars using phrases such as "multiple cars".
 Occlusion occurs when a vehicle is partially or almost entirely hidden behind another visible object, such as another vehicle, a tree, a wall, or a barrier. Only external obstructions count as occlusion. Parts naturally invisible due to the vehicle's orientation or perspective must not be considered occluded.
 Truncation occurs when a vehicle extends beyond one or more image boundaries, causing part of the vehicle to fall outside the captured area. Truncation must not be confused with occlusion caused by other objects.
 

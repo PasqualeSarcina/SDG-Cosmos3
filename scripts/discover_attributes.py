@@ -19,7 +19,8 @@ from src.request.response_errors import EmptyResponseError, response_content
 from src.request.response_parsing import parse_json_response
 
 log = logging.getLogger(__name__)
-ATTRIBUTE_FIELDS = ("foreground", "background", "lighting", "weather", "visibility")
+ATTRIBUTE_FIELDS = ("foreground", "background", "cars_visibility")
+EXACT_FIELDS = ("lighting", "weather")
 ATTRIBUTE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -135,11 +136,11 @@ async def _request_json(
     )
     if enable_thinking:
         parameters["reasoning_effort"] = args.reasoning_effort
-    # Timeout, worker count and retry limits may change without invalidating
+    # Server, timeout, worker count and retry limits may change without invalidating
     # completed requests; input, prompt, model and generation parameters may not.
     def request_signature(request_parameters):
         return hashlib.sha256(json.dumps(
-            {"server": args.server, "parameters": request_parameters},
+            {"parameters": request_parameters},
             ensure_ascii=False, sort_keys=True,
         ).encode("utf-8")).hexdigest()
 
@@ -166,6 +167,16 @@ async def _request_json(
         saved_signature = request_signature(variant)
         saved_path = args.output / "checkpoints" / f"{response_stem}.{saved_signature}.json"
         checkpoint_candidates.append((saved_path, saved_signature, variant["max_tokens"]))
+    if getattr(args, "resume", True):
+        # Legacy checkpoints stored only a server-dependent hash and attributes.
+        # Trust the selected output folder for those requests: their original
+        # input/model/parameters cannot be recovered from the hash.
+        known_paths = {path for path, _, _ in checkpoint_candidates}
+        for path in sorted((args.output / "checkpoints").glob(f"{response_stem}.*.json")):
+            if path not in known_paths:
+                saved_signature = path.name[len(response_stem) + 1:-5]
+                if re.fullmatch(r"[0-9a-f]{64}", saved_signature):
+                    checkpoint_candidates.append((path, saved_signature, None))
     for saved_path, saved_signature, saved_max_tokens in (checkpoint_candidates if getattr(args, "resume", True) else ()):
         if not saved_path.is_file():
             continue
@@ -173,11 +184,21 @@ async def _request_json(
             saved = json.loads(saved_path.read_text(encoding="utf-8"))
             if not isinstance(saved, dict) or saved.get("request_sha256") != saved_signature:
                 raise ValueError("Checkpoint request signature does not match.")
+            if saved_max_tokens is None and "signature_version" in saved:
+                # New checkpoints must match the server-independent signature.
+                continue
             data = validate(saved.get("attributes"))
         except (OSError, ValueError) as exc:
             log.warning("Ignoring invalid checkpoint %s: %s", saved_path, exc)
         else:
-            log.info("Reusing completed request: %s (checkpoint max_tokens=%d)", operation, saved_max_tokens)
+            if saved_max_tokens is None:
+                log.warning(
+                    "Reusing legacy checkpoint from output folder: %s. Content validated; "
+                    "original input, model and parameters cannot be verified. "
+                    "Use --no-resume to regenerate.", saved_path,
+                )
+            else:
+                log.info("Reusing completed request: %s (checkpoint max_tokens=%d)", operation, saved_max_tokens)
             return data
 
     def final_content(response, response_path):
@@ -251,7 +272,9 @@ async def _request_json(
         # A timeout is not evidence of a context limit, so do not split it either.
         retry_if=(lambda exc: not isinstance(exc, APITimeoutError) and not _consolidation_should_split(exc)) if split_on_limit else None,
     )
-    _write_json_atomic(checkpoint_path, {"request_sha256": signature, "attributes": data})
+    _write_json_atomic(checkpoint_path, {
+        "signature_version": 2, "request_sha256": signature, "attributes": data,
+    })
     return data
 
 
@@ -402,6 +425,23 @@ async def discover_attributes(
         raise ValueError("--resume-max-tokens must be >= 1.")
     if not examples:
         raise ValueError("No examples to analyze.")
+    exact_attributes = {field: [] for field in EXACT_FIELDS}
+    for example in examples:
+        for field in EXACT_FIELDS:
+            if field not in example:
+                continue
+            value = example[field]
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{field} must be a nonempty string.")
+            if value not in exact_attributes[field]:
+                exact_attributes[field].append(value)
+    # Fixed categorical values require only exact deduplication, not extraction
+    # or semantic consolidation. Exclude the derived count from model inputs too.
+    examples = [
+        {key: value for key, value in example.items()
+         if key not in (*EXACT_FIELDS, "cars_count")}
+        for example in examples
+    ]
     consolidation_prompt = (_PACKAGE_DIR / "src/templates/consolidate_attributes.txt").read_text(encoding="utf-8")
     total_batches = (len(examples) + args.batch_size - 1) // args.batch_size
     async with create_client(
@@ -430,6 +470,7 @@ async def discover_attributes(
         log.info("Consolidating %d extraction JSONs with pairwise tree reduction", len(results))
         data = await consolidate_attributes(args, client, model, consolidation_prompt, results)
 
+    data = {**data, **exact_attributes}
     output_path = args.output / "attributes.json"
     _write_json_atomic(output_path, data)
     log.info("Attributes saved: %s", output_path)
@@ -440,7 +481,7 @@ def main():
     parser = argparse.ArgumentParser(description="Discover visual attributes with Qwen3.8-27B thinking.")
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--batch-size", type=int, default=20, help="Maximum descriptions per request; all files are analyzed.")
+    parser.add_argument("--batch-size", type=int, default=32, help="Maximum descriptions per request; all files are analyzed.")
     parser.add_argument("--max-workers", "--max_workers", type=int, default=16, help="Maximum concurrent extraction batches or merges within a consolidation round; use 1 for sequential requests.")
     parser.add_argument("--consolidation-max-tokens", type=int, default=None, help="Separate consolidation output budget; defaults to --max-tokens and does not invalidate extraction checkpoints.")
     parser.add_argument("--consolidation-reasoning-effort", choices=("disabled", "low", "medium", "xhigh"), default=None, help="Thinking level for consolidation only; defaults to --reasoning-effort. Use disabled to turn off thinking and apply Qwen instruct sampling. Extraction checkpoints remain compatible.")
@@ -452,12 +493,12 @@ def main():
         help="Output budget, including thinking. Input plus output must fit the server context limit.",
     )
     parser.add_argument("--max-retries", type=int, default=3, help="Maximum attempts, including the first.")
-    parser.add_argument("--timeout", type=float, default=1600.0, help="HTTP timeout in seconds per attempt; increase for slow or queued responses.")
+    parser.add_argument("--timeout", type=float, default=3600.0, help="HTTP timeout in seconds per attempt; increase for slow or queued responses.")
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"), default="medium")
     parser.add_argument("--debug", action="store_true", help="Save raw API responses under output/debug/.")
     parser.add_argument(
         "--resume", action=argparse.BooleanOptionalAction, default=True,
-        help="Reuse matching completed requests from output/checkpoints/ (default); --no-resume regenerates them.",
+        help="Resume from output/checkpoints/ even if --server changes (default). Legacy checkpoints are matched by request name and validated; new ones also check input, model and parameters. --no-resume regenerates them.",
     )
     parser.add_argument("--resume-max-tokens", type=int, default=None, help="Also reuse validated checkpoints created with this previous output budget. Only max_tokens may differ; new requests use the current budgets.")
     args = parser.parse_args()

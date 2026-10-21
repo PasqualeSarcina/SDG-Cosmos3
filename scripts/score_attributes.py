@@ -25,7 +25,7 @@ from src.request.response_errors import response_content
 from src.request.response_parsing import parse_json_response
 
 log = logging.getLogger(__name__)
-ATTRIBUTE_FIELDS = ("foreground", "background", "lighting", "weather", "visibility")
+ATTRIBUTE_FIELDS = ("foreground", "background", "lighting", "weather", "cars_visibility")
 JUDGMENT_SCHEMA = {
     "type": "object",
     "properties": {"judgment": {"type": "integer", "enum": [0, 1]}},
@@ -149,13 +149,12 @@ def load_representatives(path: Path, input_dir: Path) -> list[dict]:
             if not isinstance(value, str):
                 raise ValueError(f"{source}: {field} must be present and must be a string.")
             fields[field] = value
-        cars = data.get("cars")
-        if not isinstance(cars, list) or any(
-            not isinstance(car, dict) or not isinstance(car.get("visibility"), str)
-            for car in cars
+        cars_visibility = data.get("cars_visibility")
+        if not isinstance(cars_visibility, list) or any(
+            not isinstance(value, str) for value in cars_visibility
         ):
-            raise ValueError(f"{source}: cars must be a list of objects with a string visibility field.")
-        fields["visibility"] = [car["visibility"] for car in cars]
+            raise ValueError(f"{source}: cars_visibility must be a list of strings.")
+        fields["cars_visibility"] = cars_visibility
         examples.append({"id": scene_id, "source_file": str(source), "fields": fields})
     return examples
 

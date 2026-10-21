@@ -11,7 +11,7 @@ MODEL_NAME = "Alibaba-NLP/gte-modernbert-base"
 
 
 def json_to_text(data: dict) -> str:
-    """Converte una descrizione strutturata in testo per l'encoder."""
+    """Converte la scena e la visibilità di ogni auto in testo per l'encoder."""
     if not isinstance(data, dict):
         raise ValueError("Il file deve contenere un singolo oggetto JSON.")
 
@@ -22,35 +22,28 @@ def json_to_text(data: dict) -> str:
         if value is not None and str(value).strip():
             parts.append(f"{field}: {str(value).strip()}")
 
-    cars = data.get("cars", [])
-    if cars is None:
-        cars = []
-    if not isinstance(cars, list):
-        raise ValueError("'cars' deve essere una lista.")
+    cars_visibility = data.get("cars_visibility", [])
+    if cars_visibility is None:
+        cars_visibility = []
+    if not isinstance(cars_visibility, list):
+        raise ValueError("'cars_visibility' deve essere una lista.")
 
     cars_count = data.get("cars_count")
     if cars_count is None:
-        cars_count = len(cars)
+        cars_count = len(cars_visibility)
 
     parts.append(f"cars_count: {cars_count}")
 
-    for index, car in enumerate(cars, start=1):
-        if not isinstance(car, dict):
-            raise ValueError(f"L'auto {index} deve essere un oggetto JSON.")
-
-        # Include anche eventuali dettagli aggiunti in futuro alle auto.
-        details = [
-            f"{key}: {value}"
-            for key, value in car.items()
-            if value is not None and str(value).strip()
-        ]
-        if details:
-            parts.append(f"car {index}: " + "; ".join(details))
+    for index, visibility in enumerate(cars_visibility, start=1):
+        if not isinstance(visibility, str):
+            raise ValueError(f"La visibilità dell'auto {index} deve essere una stringa.")
+        if visibility.strip():
+            parts.append(f"car {index}: visibility: {visibility.strip()}")
 
     if not any(
         str(data.get(field) or "").strip()
         for field in ("foreground", "background", "lighting", "weather")
-    ) and not cars:
+    ) and not any(visibility.strip() for visibility in cars_visibility):
         raise ValueError("Nessuna descrizione della scena trovata.")
 
     return "\n".join(parts)

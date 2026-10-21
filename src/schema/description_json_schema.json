@@ -4,42 +4,52 @@
   "properties": {
     "foreground": {
       "type": "string",
-      "description": "Short description of the main subjects visible in the foreground."
+      "description": "Detailed description of the main subjects visible in the foreground. Do not invent details."
     },
     "background": {
       "type": "string",
-      "description": "Short description of the background, environment, distant subjects and setting."
+      "description": "Detailed description of the background, environment, distant subjects and setting. Sky is NOT part of the background. Do not invent details."
     },
     "lighting": {
       "type": "string",
-      "description": "Short description of the illumination conditions, including light source, intensity, direction and shadows."
+      "description": "Description of the illumination conditions, including light source, intensity, direction and shadows. Choose exactly one of the allowed values.",
+      "enum": [
+        "Direct sunlight with sharp shadows",
+        "Soft, diffuse natural light with subtle shadows",
+        "Faint natural light",
+        "Artificial light sources",
+        "Combination of natural and artificial light",
+        "Nighttime with little or no ambient light"
+      ]
     },
     "weather": {
       "type": "string",
-      "description": "Short description of atmospheric and weather conditions."
+      "description": "Description of atmospheric and weather conditions. Choose exactly one of the allowed values.",
+      "enum": [
+        "Clear, with little or no cloud cover",
+        "Partly cloudy, with patches of clear sky",
+        "Overcast, with extensive cloud cover",
+        "Rainy, with rain falling",
+        "Snowy, with snow falling",
+        "Foggy, with reduced visibility"
+      ]
     },
-    "cars": {
+    "cars_visibility": {
       "type": "array",
-      "description": "Cars visible in the image. Use an empty array if no cars are visible.",
+      "description": "One visibility description for each individually distinguishable car visible in the image. Every image contains at least one car. Do not invent cars or count vehicles that cannot be visually identified as cars. Cars include sedans, hatchbacks, station wagons, coupes, convertibles, SUVs, crossovers and passenger-oriented minivans. Exclude buses, heavy trucks, motorcycles, bicycles and specialized industrial or agricultural vehicles. Do not group cars using phrases such as 'multiple cars'.",
+      "minItems": 1,
       "items": {
-        "type": "object",
-        "properties": {
-          "visibility": {
-            "type": "string",
-            "description": "Description of the car's visibility, considering both occlusion and truncation.",
-            "examples": [
-              "Fully visible",
-              "Partially occluded",
-              "Severely truncated",
-              "Slightly occluded and partially truncated"
-            ]
-          }
-        },
-        "required": ["visibility"],
-        "additionalProperties": false
+        "type": "string",
+        "description": "Independently assess the car's occlusion and truncation and summarize both. Occlusion means the car is hidden behind another visible object; describe what causes the occlusion. Parts invisible due to orientation or perspective are not occluded. Truncation means the car extends beyond an image boundary. Do not confuse truncation with occlusion. If neither applies, use 'Fully visible'.",
+        "examples": [
+          "Fully visible",
+          "Partially occluded by another car",
+          "Severely truncated",
+          "Slightly occluded by a tree and partially truncated"
+        ]
       }
     }
   },
-  "required": ["foreground", "background", "lighting", "weather", "cars"],
+  "required": ["foreground", "background", "lighting", "weather", "cars_visibility"],
   "additionalProperties": false
 }

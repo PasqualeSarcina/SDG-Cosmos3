@@ -1,4 +1,4 @@
-"""Generate Cosmos descriptions with score-weighted conditions; no training.
+"""Generate Cosmos descriptions with weighted or uniform attribute sampling; no training.
 
 This application is inspired by DADO. Attribute cardinality and internal scene
 planning/self-checks are implementation choices, not claims about DADO.
@@ -26,7 +26,10 @@ ROOT = Path(__file__).resolve().parents[1]
 if not __package__:
     sys.path.insert(0, str(ROOT))
 
-from scripts.score_attributes import ATTRIBUTE_FIELDS, VISIBILITY_UNIT, load_representatives
+from scripts.score_attributes import (
+    ATTRIBUTE_FIELDS, VISIBILITY_UNIT, cars_count_distribution, load_attributes,
+    load_representatives,
+)
 from scripts.prompt_upsampling import RESOLUTION_RATIO_DICT
 from src.request.client import chat_completion, create_client, resolve_model, run_batch
 from src.request.response_errors import response_content
@@ -130,6 +133,15 @@ def load_scores(path):
     return data, pools, sorted(counts)
 
 
+def load_uniform_conditions(attributes_path, input_dir):
+    """Bypass scores; keep the original car-count distribution without API calls."""
+    attributes = load_attributes(attributes_path)
+    pools = {field: [(name, 1.0) for name in attributes[field]] for field in ATTRIBUTE_FIELDS}
+    distribution = cars_count_distribution(input_dir)
+    counts = [(int(value), row["probability"]) for value, row in distribution["frequencies"].items()]
+    return pools, counts
+
+
 def choose(rng, pool, count, *, replace=False):
     """Weighted draws; replacement is allowed for per-car visibility samples."""
     if count == 0:
@@ -152,7 +164,7 @@ def sample_conditions(rng, pools, counts, cardinalities):
         "cars_count": cars_count,
         "attributes": {
             field: choose(rng, pools[field], cars_count if cardinalities[field] is None else cardinalities[field],
-                          replace=field == "visibility")
+                          replace=field == "cars_visibility")
             for field in ATTRIBUTE_FIELDS
         },
         "visibility_unit": VISIBILITY_UNIT,
@@ -170,13 +182,19 @@ def validator(schema):
     return cls(schema, registry=Registry(retrieve=no_remote_resources))
 
 
-def load_schema(path):
+def load_schema(path, *, resolution="720", aspect_ratio="16,9"):
     schema = read_json(path)
     converted = isinstance(schema, dict) and "type" not in schema and "subjects" in schema
     if converted:
         wire = t2i_template_to_json_schema(schema)
         canonical = copy.deepcopy(wire)
         canonical["properties"]["subject_details"] = {"type": "object", "additionalProperties": {"type": "string"}}
+        dimensions = RESOLUTION_RATIO_DICT[resolution][aspect_ratio]
+        for output_schema in (wire, canonical):
+            properties = output_schema["properties"]
+            for axis, value in dimensions.items():
+                properties["resolution"]["properties"][axis]["enum"] = [value]
+            properties["aspect_ratio"]["enum"] = [aspect_ratio]
     else:
         wire = canonical = schema
     if not isinstance(wire, dict) or wire.get("type") != "object":
@@ -207,8 +225,8 @@ def structural_validation(data, conditions, schema):
     validator(schema).validate(data)
     if "cars_count" in data and (type(data["cars_count"]) is not int or data["cars_count"] != conditions["cars_count"]):
         raise ValueError("cars_count does not match the sampled count.")
-    if "cars" in data and (not isinstance(data["cars"], list) or len(data["cars"]) != conditions["cars_count"]):
-        raise ValueError("cars array length does not match the sampled count.")
+    if "cars_visibility" in data and (not isinstance(data["cars_visibility"], list) or len(data["cars_visibility"]) != conditions["cars_count"]):
+        raise ValueError("cars_visibility array length does not match the sampled count.")
     if "subjects" in data:
         subjects = data["subjects"]
         # Cars must each occupy a separate subject entry. This is a necessary
@@ -245,16 +263,25 @@ def write_file(path, content, overwrite=False):
 
 
 async def generate(args, *, client=None, model=None, on_scene_result=None):
-    """Run bounded concurrent scenes; optional observers receive in-memory results only."""
+    """Run bounded concurrent scenes and persist each prompt's sampled conditions."""
     if args.max_workers < 1:
         raise ValueError("--max-workers must be >= 1.")
-    _, pools, counts = load_scores(args.scores)
+    attributes_path = getattr(args, "attributes", None)
+    scores_path = getattr(args, "scores", None)
+    if (attributes_path is None) == (scores_path is None):
+        raise ValueError("Specify exactly one of --scores or --attributes.")
+    if attributes_path is not None:
+        pools, counts = load_uniform_conditions(attributes_path, args.input)
+        log.info("Uniform attribute sampling from %s; car counts follow the original JSON distribution; seed=%s",
+                 attributes_path, args.seed)
+    else:
+        _, pools, counts = load_scores(scores_path)
     cardinalities = {
-        field: (5 if field in ("foreground", "background") else 1) if pools[field] else 0
+        field: (2 if field in ("foreground", "background") else 1) if pools[field] else 0
         for field in ATTRIBUTE_FIELDS
     }
     # None means the visibility cardinality follows each scene's sampled count.
-    cardinalities["visibility"] = None
+    cardinalities["cars_visibility"] = None
     for field in ATTRIBUTE_FIELDS:
         if not pools[field]:
             log.warning("%s: no positive-weight attributes; no condition will be imposed.", field)
@@ -265,15 +292,15 @@ async def generate(args, *, client=None, model=None, on_scene_result=None):
         cardinalities[field] = int(number)
     for field, count in cardinalities.items():
         required = max(value for value, _ in counts) if count is None else count
-        if field == "visibility":
+        if field == "cars_visibility":
             if required > 0 and not pools[field]:
-                raise ValueError("visibility: at least one positive-weight attribute is required to sample with replacement.")
+                raise ValueError("cars_visibility: at least one positive-weight attribute is required to sample with replacement.")
         elif required > len(pools[field]):
             raise ValueError(f"{field}: requested {required} attributes but only {len(pools[field])} have positive weight.")
     examples = load_examples(args.representatives, args.input)
     if args.examples_per_prompt > len(examples):
         raise ValueError("--examples-per-prompt exceeds the number of selected demonstrations.")
-    wire, canonical, converted = load_schema(args.schema)
+    wire, canonical, converted = load_schema(args.schema, resolution=args.resolution, aspect_ratio=args.aspect_ratio)
     compact_schema = read_json(COMPACT_SCHEMA_PATH)
     validator(compact_schema)
     template = Template((ROOT / "prompts/generate_descriptions.txt").read_text(encoding="utf-8"))
@@ -282,8 +309,11 @@ async def generate(args, *, client=None, model=None, on_scene_result=None):
     if converted:
         output_parameters = f"Use resolution={dump(dimensions)} and aspect_ratio={args.aspect_ratio!r}."
     # Reject dangerous overlaps even with --overwrite. Only managed output files change.
-    protected = [args.input, args.scores, args.representatives, args.schema, COMPACT_SCHEMA_PATH, ROOT / "prompts"]
+    protected = [args.input, args.representatives, args.schema, COMPACT_SCHEMA_PATH, ROOT / "prompts"]
+    protected.extend(path for path in (scores_path, attributes_path) if path is not None)
     output = args.output.resolve()
+    log_option = getattr(args, "log_output", None)
+    logs = Path(log_option).resolve() if log_option is not None else output.with_name(output.name + "_logs")
     preview = None
     if args.dry_run:
         preview_option = getattr(args, "preview_output", None)
@@ -291,6 +321,12 @@ async def generate(args, *, client=None, model=None, on_scene_result=None):
         if output == preview or output in preview.parents or preview in output.parents:
             raise ValueError("--output and --preview-output must be separate directories, with neither inside the other.")
     for destination in (output, preview) if preview is not None else (output,):
+        if logs == destination or logs in destination.parents or destination in logs.parents:
+            raise ValueError("--log-output and scene/preview outputs must be separate directories, with neither inside the other.")
+    if any(path.resolve() == logs or logs in path.resolve().parents or path.resolve() in logs.parents for path in protected):
+        raise ValueError("Log output must be separate from input data, schema and prompt templates.")
+    destinations = [output, logs] + ([preview] if preview is not None else [])
+    for destination in destinations:
         if any(path.resolve() == destination or destination in path.resolve().parents for path in protected):
             raise ValueError("Output directories must not contain input data, schema or prompt templates.")
         if destination.exists() and (not destination.is_dir() or (any(destination.iterdir()) and not args.overwrite)):
@@ -311,6 +347,7 @@ async def generate(args, *, client=None, model=None, on_scene_result=None):
     if not args.dry_run:
         model = model or await resolve_model(client, args.model)
     output.mkdir(parents=True, exist_ok=True)
+    logs.mkdir(parents=True, exist_ok=True)
     for path in previous_paths:
         # Current target files are explicitly replaced only with --overwrite.
         if not args.dry_run and path.name in targets:
@@ -318,6 +355,7 @@ async def generate(args, *, client=None, model=None, on_scene_result=None):
     summary = {"requested": args.number, "valid": 0, "failed": 0, "dry_run": 0, "failed_ids": []}
     state_lock = asyncio.Lock()
     log.info("Scene JSON directory: %s", output)
+    log.info("Per-prompt attribute logs: %s", logs)
 
     async def process_scene(index):
         scene_id = f"scene_{index:06d}"
@@ -327,7 +365,14 @@ async def generate(args, *, client=None, model=None, on_scene_result=None):
         prompt = build_prompt(template, conditions, selected_examples, wire, output_parameters, compact_schema)
         row = {"id": scene_id, "example_ids": [e["id"] for e in selected_examples],
                "model": model or args.model, "conditions": conditions, "attempts": [],
+               "seed": args.seed, "sampling_mode": "uniform" if attributes_path is not None else "weighted",
+               "attributes_source": str(Path(attributes_path if attributes_path is not None else scores_path).resolve()),
+               "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(), "output_file": None,
                "status": "dry_run" if args.dry_run else "generating"}
+        log_path = logs / f"{scene_id}.attributes.json"
+        # Persist before the request, including repeated per-car visibility draws.
+        # Later writes update only this scene's record; no shared append stream.
+        write_file(log_path, dump(row), args.overwrite)
         if args.dry_run:
             write_file(preview / f"{scene_id}.txt", prompt, args.overwrite)
             write_file(preview / f"{scene_id}.conditions.json", dump(conditions), args.overwrite)
@@ -364,13 +409,21 @@ async def generate(args, *, client=None, model=None, on_scene_result=None):
                         existing.add(digest)
                         event["validation"]["unique"] = True
                         row["status"] = "valid"
+                        row["output_file"] = str(output / f"{scene_id}.json")
                     break
+                except asyncio.CancelledError:
+                    row["status"] = "interrupted"
+                    event["error"] = "Generation cancelled."
+                    raise
                 except Exception as exc:
                     event["error"] = str(exc)
                     log.warning("%s attempt %d/%d: %s", scene_id, attempt, args.max_attempts, exc)
+                finally:
+                    write_file(log_path, dump(row), overwrite=True)
             if row["status"] != "valid":
                 row["status"] = "failed"
                 row["failure_stage"] = "generation"
+        write_file(log_path, dump(row), overwrite=True)
         async with state_lock:
             summary[row["status"]] += 1
             if row["status"] == "failed":
@@ -391,13 +444,18 @@ async def generate(args, *, client=None, model=None, on_scene_result=None):
 
 def cli_main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scores", required=True, type=Path)
+    sampling = parser.add_mutually_exclusive_group(required=True)
+    sampling.add_argument("--scores", type=Path, help="Score-weighted sampling from score_attributes.py output.")
+    sampling.add_argument("--attributes", type=Path,
+                          help="Bypass scoring: uniformly sample attributes.json using --seed. Car-count probabilities are computed from the originals' cars_count values.")
     parser.add_argument("--input", "--originals", required=True, type=Path, help="Original scene JSON directory.")
     parser.add_argument("--representatives", "--demonstrations", required=True, type=Path, help="Selected representatives.json; run select_representatives.py first.")
     parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA, help="Cosmos T2I template or JSON Schema.")
     parser.add_argument("--output", required=True, type=Path, help="Directory containing only validated scene JSONs, ready for image generation.")
     parser.add_argument("--preview-output", type=Path, default=None,
                         help="Only for --dry-run: save prompt previews here (default: <output>_preview).")
+    parser.add_argument("--log-output", type=Path, default=None,
+                        help="Save per-prompt sampled attributes, seed, examples and attempt results here (default: <output>_logs). Must be separate from scene and preview directories.")
     parser.add_argument("--number", "-n", type=int, required=True)
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--examples-per-prompt", type=int, default=3)
@@ -406,11 +464,12 @@ def cli_main(argv=None):
     parser.add_argument("--max-workers", "--max_workers", type=int, default=16,
                         help="Maximum concurrent scenes/LLM requests (default: %(default)s); use 1 for sequential execution.")
     parser.add_argument("--attributes-per-field", action="append", default=[], metavar="FIELD=COUNT",
-                        help="Override a field's count. Defaults: foreground=5, background=5, lighting=1, weather=1; visibility follows sampled cars_count and allows repeated attributes. Empty non-visibility pools impose no conditions.")
+                        help="Override a field's count. Defaults: foreground=5, background=5, lighting=1, weather=1; cars_visibility follows sampled cars_count and allows repeated attributes. Empty non-visibility pools impose no conditions.")
     parser.add_argument("--server", help="Project OpenAI-compatible endpoint; required outside dry-run.")
     parser.add_argument("--model", default=None)
-    parser.add_argument("--api-token", "--api_token", default=None)
-    parser.add_argument("--timeout", type=float, default=1200.0)
+    parser.add_argument("--api-token", "--api_token", "--api-key", default=None,
+                        help="API key for server authentication (aliases: --api-token, --api_token).")
+    parser.add_argument("--timeout", type=float, default=3600.0)
     parser.add_argument("--max-tokens", type=int, default=16384)
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"), default="medium")
     parser.add_argument("--resolution", choices=tuple(RESOLUTION_RATIO_DICT), default="720")

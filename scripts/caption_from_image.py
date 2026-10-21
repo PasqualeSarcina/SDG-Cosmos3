@@ -39,11 +39,11 @@ class Args:
     """Optional API token for authentication with the server."""
     model: str | None = None
     """Model name. If omitted, use the first model returned by the endpoint."""
-    max_workers: Annotated[int, tyro.conf.arg(aliases=["--max_workers"])] = 16
+    max_workers: Annotated[int, tyro.conf.arg(aliases=["--max_workers"])] = 32
     """Maximum concurrent requests."""
     max_retries: Annotated[int, tyro.conf.arg(aliases=["--max_retries"])] = 3
     """Maximum attempts per image, including the first request."""
-    max_tokens: Annotated[int, tyro.conf.arg(aliases=["--max_tokens"])] = 10240
+    max_tokens: Annotated[int, tyro.conf.arg(aliases=["--max_tokens"])] = 16384
     """Maximum output tokens per request."""
     timeout: float = 1200.0
     """Per-request timeout in seconds."""
@@ -180,16 +180,14 @@ async def _process_single(
         data = parse_json_response(text)
         if not isinstance(data, dict) or set(data) != set(schema["required"]):
             raise ValueError("Caption response must contain exactly the description schema fields.")
-        if any(not isinstance(value, str) for key, value in data.items() if key != "cars"):
-            raise ValueError("Description fields other than cars must be strings.")
-        cars = data["cars"]
-        if not isinstance(cars, list) or any(
-            not isinstance(car, dict) or set(car) != {"visibility"}
-            or not isinstance(car["visibility"], str)
-            for car in cars
+        if any(not isinstance(value, str) for key, value in data.items() if key != "cars_visibility"):
+            raise ValueError("Description fields other than cars_visibility must be strings.")
+        cars_visibility = data["cars_visibility"]
+        if not isinstance(cars_visibility, list) or any(
+            not isinstance(visibility, str) for visibility in cars_visibility
         ):
-            raise ValueError("cars must be a list of objects containing a visibility string.")
-        data["cars_count"] = len(cars)
+            raise ValueError("cars_visibility must be a list of strings.")
+        data["cars_count"] = len(cars_visibility)
         output_dir.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
             json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
