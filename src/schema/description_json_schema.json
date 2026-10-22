@@ -33,23 +33,8 @@
         "Snowy, with snow falling",
         "Foggy, with reduced visibility"
       ]
-    },
-    "cars_visibility": {
-      "type": "array",
-      "description": "One visibility description for each individually distinguishable car visible in the image. Every image contains at least one car. Do not invent cars or count vehicles that cannot be visually identified as cars. Cars include sedans, hatchbacks, station wagons, coupes, convertibles, SUVs, crossovers and passenger-oriented minivans. Exclude buses, heavy trucks, motorcycles, bicycles and specialized industrial or agricultural vehicles. Do not group cars using phrases such as 'multiple cars'.",
-      "minItems": 1,
-      "items": {
-        "type": "string",
-        "description": "Independently assess the car's occlusion and truncation and summarize both. Occlusion means the car is hidden behind another visible object; describe what causes the occlusion. Parts invisible due to orientation or perspective are not occluded. Truncation means the car extends beyond an image boundary. Do not confuse truncation with occlusion. If neither applies, use 'Fully visible'.",
-        "examples": [
-          "Fully visible",
-          "Partially occluded by another car",
-          "Severely truncated",
-          "Slightly occluded by a tree and partially truncated"
-        ]
-      }
     }
   },
-  "required": ["foreground", "background", "lighting", "weather", "cars_visibility"],
+  "required": ["foreground", "background", "lighting", "weather"],
   "additionalProperties": false
 }

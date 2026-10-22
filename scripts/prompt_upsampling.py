@@ -81,7 +81,7 @@ RESOLUTION_RATIO_DICT: dict[str, dict[str, dict[str, int]]] = {
 }
 
 SRC_DIR = Path(__file__).resolve().parents[1] / "src"
-PROMPTING_TEMPLATES_DIR = SRC_DIR / "upsampling"
+PROMPTING_TEMPLATES_DIR = SRC_DIR / "templates"
 
 
 def build_openai_message(
@@ -154,8 +154,8 @@ class PromptUpsamplerConfig:
     timeout_s: float
     max_tokens: int
     max_retries: int
-    temperature: float | None
-    top_p: float | None
+    temperature: float | None = 1.0
+    top_p: float | None = 0.95
     system_prompt_path: str | Path | None = None
     system_prompt: str = field(init=False, repr=False)
 
@@ -249,6 +249,14 @@ class PromptUpsamplerClient:
             "model": model,
             **request,
             "max_completion_tokens": self.config.max_tokens,
+            "presence_penalty": 0.0,
+            "reasoning_effort": "medium",
+            "extra_body": {
+                "top_k": 20,
+                "min_p": 0.0,
+                "repetition_penalty": 1.0,
+                "chat_template_kwargs": {"enable_thinking": True},
+            },
         }
         for name in ("temperature", "top_p"):
             value = getattr(self.config, name)
@@ -398,7 +406,7 @@ class Args:
     api_token: str | None = None
     """API token."""
     system_prompt: Path | None = None
-    """UTF-8 system message file. Defaults to src/upsampling/t2i_system_upsampler_prompt.txt."""
+    """UTF-8 system message file. Defaults to src/templates/t2i_system_upsampler_prompt.txt."""
     additional_instruction: str = ""
     """Additional user instructions."""
     resolution: str = "720"
@@ -409,14 +417,14 @@ class Args:
     """Request timeout in seconds."""
     max_tokens: int = 8192
     """Maximum response tokens."""
-    max_retries: int = 10
+    max_retries: int = 3
     """Prompt upsampling attempts per prompt."""
-    max_workers: Annotated[int, tyro.conf.arg(aliases=["--max_workers"])] = 16
+    max_workers: Annotated[int, tyro.conf.arg(aliases=["--max_workers"])] = 8
     """Maximum parallel requests."""
-    temperature: OptionalFloat = None
-    """Optional sampling temperature; 'none' or 'null' omits it."""
-    top_p: OptionalFloat = None
-    """Optional sampling top-p; 'none' or 'null' omits it."""
+    temperature: OptionalFloat = 1.0
+    """Thinking sampling temperature; 'none' or 'null' omits it."""
+    top_p: OptionalFloat = 0.95
+    """Thinking sampling top-p; 'none' or 'null' omits it."""
     debug: bool = False
     """Enable debug logging and save raw API responses to <output>/debug/."""
     config: PromptUpsamplerConfig = field(init=False, repr=False)

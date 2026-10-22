@@ -5,17 +5,19 @@ You must perform the task in two phases.
 
 ### PHASE 1: SCENE DESCRIPTION MODIFICATION (INTERNAL STRUCTURED JSON)
 
-The user provides an INPUT SCENE DESCRIPTION as a JSON object with exactly four fields:
+The user provides an INPUT SCENE DESCRIPTION as a JSON object with exactly five fields:
 {
  "foreground": "short description of the main subjects visible in the foreground",
  "background": "short description of the background, environment, distant subjects and setting",
  "lighting": "short description of the illumination conditions, including light source, intensity, direction, shadows",
- "weather": "short description of atmospheric and weather conditions"
+ "weather": "short description of atmospheric and weather conditions",
+ "cars_count": "approximate total number of clearly distinguishable passenger cars across the foreground and background"
 }
 
 First, modify these four descriptions according to ADDITIONAL USER INSTRUCTIONS.
 Preserve any original information that does not conflict with the requested modifications.
-Construct the modified four-field JSON internally, but DO NOT include it in your response.
+Preserve cars_count unless the additional instructions require changing the number of cars.
+Construct the modified five-field JSON internally, but DO NOT include it in your response.
 
 Use this modified description as the reference for Phase 2.
 
@@ -33,11 +35,14 @@ The output MUST strictly follow the template:
 - Do not leave applicable fields empty simply because the input is sparse.
 
 Use the Phase 1 fields as follows:
-- foreground -> subjects
-- background -> background_setting
+- foreground -> subjects and quadrant scan
+- background -> background_setting and quadrant scan
 - lighting -> lighting and aesthetics
 - weather -> weather-related and atmospheric descriptions throughout the JSON
-The phase 1 filed should be considered a source of inspiration for the upsampling procedure. You are encouraged to add details and other plausible and realistic subjects, objects and details, both in the foreground and background.
+- cars_count -> approximate total number of clearly distinguishable passenger cars across the entire scene, including foreground and background cars. Preserve the cars and their placement already described in the input foreground and background fields. Use cars_count as an approximate guide to the overall total, not as a separate count for each field. References to the same car across output fields describe the same vehicle and do not imply additional cars.
+
+The Phase 1 fields should be considered a source of inspiration for the upsampling procedure. You are encouraged to enrich the scene with plausible, realistic subjects, objects and visual details in both the foreground and background.
+Keep these additions consistent with the established scene, the existing cars and the approximate total indicated by cars_count.
 
 ### OUTPUT PARAMETERS
 JSON Schema to complete:
@@ -118,40 +123,33 @@ JSON Schema to complete:
 }
 
 
-### MANDATORY PASSENGER CAR REQUIREMENT
+### PASSENGER CAR CONSISTENCY WITH THE INPUT SCENE
 
-Every generated scene MUST contain at least one visible passenger car, even if the input does not mention cars.
+Use the Phase 1 foreground, background and cars_count together as the reference for the scene's cars.
+Preserve the cars already described, including their explicit quantities, placement, activities, visibility,
+relative scale and relationships to the other subjects. Enrich their visual details consistently with this
+information. Change these decisions only when required by ADDITIONAL USER INSTRUCTIONS.
 
-The subjects array MUST NEVER be empty.
+cars_count is an approximate guide to the total number of clearly distinguishable passenger cars across
+the entire scene, not a separate target for subjects and background_setting. Keep explicitly described
+cars and groups consistent with that overall total. Do not add, remove or relocate cars merely to introduce
+variation or satisfy a generic minimum-car requirement.
 
-At least one subjects element MUST explicitly describe a passenger car or a group of passenger cars.
+Describe foreground cars in subjects alongside the scene's other main subjects. Describe background cars
+in background_setting and the corresponding quadrant_scan regions, preserving their background placement.
+If a background car is also represented in subjects, retain its actual location and relative scale.
+The presence of cars does not make them the main subject or require a close-up composition.
 
-Mentioning cars only in other fields is insufficient.
+For individually distinguishable cars, preserve their identity across fields and describe appearance,
+body style, position, relative size and orientation at a level of detail appropriate to their visibility.
+For dense or distant groups, collective descriptions may be used with a consistent approximate quantity
+and spatial arrangement. Set number_of_subjects consistently for each car or car group in subjects.
 
-Passenger cars may appear individually or in groups, including:
-- Moving traffic
-- Traffic queues and congestion
-- Parking lots
-- Roadside parking
-- Distant traffic
-- Mixed foreground, middle-ground, and background distributions
+Keep subjects, background_setting, quadrant_scan and comprehensive_t2i_caption consistent about the same
+vehicles. Repeated mentions of a car across fields refer to that same vehicle, not to additional cars.
 
-Describe every clearly distinguishable car individually in subjects, specifying:
-- Appearance and color
-- Body style
-- Position and relative size
-- Orientation and viewing angle
-- Visible physical characteristics
-
-For dense parking lots, long queues, or distant groups, cars MAY be described collectively, specifying their approximate quantity, arrangement, visual characteristics, and spatial distribution.
-
-Encourage substantial variation in car count, placement, scale, visibility, and arrangement.
-
-Do NOT systematically favor single cars, close-up vehicles, foreground vehicles, or any particular traffic configuration.
-
-Choose a configuration that naturally fits the scene.
-
-Trucks, buses, pick-ups, vans, motorcycles, bicycles, trains, and other vehicles do NOT satisfy the passenger car requirement.
+Trucks, buses, pick-ups, vans, motorcycles, bicycles, trains and other non-passenger vehicles may be
+described when present, but do not count them as passenger cars toward cars_count.
 
 ### FIELD COMPLETENESS
 
