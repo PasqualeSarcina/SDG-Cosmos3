@@ -2,3 +2,4 @@
 .venv
 .tests
 .idea
+uv.lock
