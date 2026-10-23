@@ -26,6 +26,8 @@ First, analyze the image and fill out the strict JSON schema below. Output this 
 Every car in the scene should be described as a separate subject in the subjects section of the JSON. Avoid grouping individually distinguishable cars using phrases such as "multiple cars".
 However, cars may be grouped when they belong to a visually repetitive, homogeneous arrangement, such as a parking lot, a dense row of parked cars, or a large background cluster where describing each vehicle separately would add little useful information. Prominent, isolated, foreground, or visually distinctive cars must still be described individually.
 
+For every field described as "one of" or with a list of allowed values, output exactly ONE of those values, with identical spelling and capitalization. Do not use synonyms, combine values, or add explanations or punctuation. For example, depth_of_field must be "Deep", not "Deep focus" or "Deep focus, keeping the background sharp"; gender must never be "Mixed" because it is not an allowed value. This rule takes precedence over the instruction to use an empty string when a field is not visible: use a listed fallback value such as "Unknown" or "N/A" when applicable.
+
 JSON Schema to complete:
 {
   "subjects": [
