@@ -54,7 +54,7 @@ class Args:
     """Maximum attempts per image, including format-validation failures."""
     gpu_memory_utilization: Annotated[float, tyro.conf.arg(aliases=["--gpu_memory_utilization"])] = 0.8
     """Fraction of each GPU's memory reserved for the vLLM engine, in (0, 1]."""
-    spec_draft_n_max: int = 2
+    spec_draft_n_max: int = 1
     """MTP speculative tokens per step; use 0 for checkpoints without MTP weights/support."""
     # Qwen/Qwen3.8-27B official Instruct (non-thinking) sampling defaults.
     temperature: float = 0.7
