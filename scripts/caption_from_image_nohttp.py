@@ -26,7 +26,7 @@ if not __package__:
 
 from src.caption.structured_caption import extract_xml_tag
 from src.request.response_parsing import parse_json_response
-from src.validation.scene_draft import validate_scene_draft
+from src.validation.scene_draft import cosmos_structural_tag, validate_scene_draft
 
 log = logging.getLogger(__name__)
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -127,6 +127,7 @@ class VLLMCaptioner:
         os.environ["TRANSFORMERS_VERBOSITY"] = "debug" if args.debug else "warning"
         try:
             from vllm import LLM, SamplingParams
+            from vllm.sampling_params import StructuredOutputsParams
         except ImportError as exc:
             raise RuntimeError(
                 "This script requires vLLM. Install the caption-vllm dependency group "
@@ -142,11 +143,15 @@ class VLLMCaptioner:
             raise RuntimeError("This script requires at least one CUDA GPU visible to PyTorch/vLLM.")
         self.args = args
         self.sampling_params_class = SamplingParams
+        self.structured_outputs = StructuredOutputsParams(
+            structural_tag=json.dumps(cosmos_structural_tag()),
+        )
         self.processor = AutoProcessor.from_pretrained(args.model, local_files_only=False)
         self.model = LLM(
             model=args.model,
             tensor_parallel_size=gpu_count,
             distributed_executor_backend="mp",
+            structured_outputs_config={"backend": "xgrammar"},
             # Only one image batch is submitted at a time.
             max_num_seqs=args.batch_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
@@ -206,6 +211,7 @@ class VLLMCaptioner:
             repetition_penalty=self.args.repetition_penalty,
             ignore_eos=False,
             skip_special_tokens=True,
+            structured_outputs=self.structured_outputs,
         )
         outputs = self.model.generate(requests, sampling_params=sampling_params, use_tqdm=False)
         if len(outputs) != len(images):

@@ -27,3 +27,32 @@ def validate_scene_draft(scene: dict, *, allow_caption_field: bool = False) -> N
     if error is not None:
         # Keep retry diagnostics useful without dumping the entire scene/schema.
         raise ValidationError(f"Invalid scene_draft at {error.json_path}: {error.message}") from error
+
+
+def cosmos_structural_tag() -> dict:
+    """Constrain both Cosmos sections in order, using the validation schema.
+
+    The JSON region enforces field types, required properties and enum values.
+    The narrative remains free text; nonempty content, normal completion and
+    semantic correctness still require checks after generation.
+    """
+    return {
+        "type": "structural_tag",
+        "format": {
+            "type": "sequence",
+            "elements": [
+                {
+                    "type": "tag",
+                    "begin": "<scene_draft>",
+                    "content": {"type": "json_schema", "json_schema": _scene_validator().schema},
+                    "end": "</scene_draft>",
+                },
+                {
+                    "type": "tag",
+                    "begin": "<comprehensive_t2i_caption>",
+                    "content": {"type": "any_text"},
+                    "end": "</comprehensive_t2i_caption>",
+                },
+            ],
+        },
+    }
