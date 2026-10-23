@@ -16,14 +16,29 @@ dependencies = [
 llm-lora-cu130 = [
     "unsloth",
     "wandb",
-    "vllm"
+    "vllm",
+    "flashinfer-python",
+    "flashinfer-cubin",
+    "flashinfer-jit-cache",
 ]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
+flashinfer-cubin = { index = "flashinfer" }
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
 explicit = true
 
