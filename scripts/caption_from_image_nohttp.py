@@ -76,7 +76,7 @@ class Args:
     description_fields: set[str] = field(init=False, default_factory=set, repr=False)
 
     def __post_init__(self) -> None:
-        for name in ("batch_size", "max_workers", "max_tokens", "max_seq_length", "max_retries"):
+        for name in ("batch_size", "max_workers", "max_retries"):
             if getattr(self, name) < 1:
                 raise ValueError(f"--{name.replace('_', '-')} must be >= 1.")
         if self.spec_draft_n_max < 0:
