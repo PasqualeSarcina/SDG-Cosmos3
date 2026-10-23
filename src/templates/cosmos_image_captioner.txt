@@ -26,7 +26,23 @@ First, analyze the image and fill out the strict JSON schema below. Output this 
 Every car in the scene should be described as a separate subject in the subjects section of the JSON. Avoid grouping individually distinguishable cars using phrases such as "multiple cars".
 However, cars may be grouped when they belong to a visually repetitive, homogeneous arrangement, such as a parking lot, a dense row of parked cars, or a large background cluster where describing each vehicle separately would add little useful information. Prominent, isolated, foreground, or visually distinctive cars must still be described individually.
 
-For every field described as "one of" or with a list of allowed values, output exactly ONE of those values, with identical spelling and capitalization. Do not use synonyms, combine values, or add explanations or punctuation. For example, depth_of_field must be "Deep", not "Deep focus" or "Deep focus, keeping the background sharp"; gender must never be "Mixed" because it is not an allowed value. This rule takes precedence over the instruction to use an empty string when a field is not visible: use a listed fallback value such as "Unknown" or "N/A" when applicable.
+For every field described as "one of" or with a list of allowed values, output exactly ONE of those values, with identical spelling and capitalization. Do not use synonyms, combine values, or add explanations or punctuation. This rule takes precedence over the instruction to use an empty string when a field is not visible: use a listed fallback value such as "Unknown" or "N/A" when applicable.
+
+STRICT RULE FOR cinematography.depth_of_field:
+This field is a categorical label, not a description. Its complete JSON string value must be exactly one of these four strings:
+- "Shallow": a limited distance range is sharp, with other distances blurred.
+- "Deep": foreground and background are both relatively sharp.
+- "Uniform focus": focus is uniform across a flat image.
+- "N/A": depth of field is not applicable or cannot be determined.
+Copy only the chosen label into depth_of_field. End the string immediately after the label. Put ALL explanations about sharp subjects, blurred backgrounds or focus distances in cinematography.focus instead.
+The "Deep" value in the template below is a valid example; choose the appropriate label for the actual image.
+
+STRICT RULE FOR subjects[*].gender:
+Every subject, including every subject group, must use exactly one of: "Male", "Female", "Unknown", "N/A".
+Use "N/A" for cars, other non-human subjects and inapplicable cases. Use "Unknown" for humans whose gender cannot be determined from visible details; do not guess.
+When a human group contains visibly different genders, describe the people individually or split them into separate subject groups, each with one allowed gender value. Keep any description of the overall group in description or relationship.
+"Mixed" is never a valid gender value. Do not combine labels or append explanations.
+The "N/A" value in the template below is a valid example; select the appropriate allowed value for each subject.
 
 JSON Schema to complete:
 {
@@ -41,7 +57,7 @@ JSON Schema to complete:
       "pose": "body position and posture",
       "clothing": "clothing and accessories; '' if non-human or N/A",
       "expression": "facial expression; '' if non-human or N/A",
-      "gender": "one of 'Male', 'Female', 'Unknown', 'N/A'",
+      "gender": "N/A",
       "age": "age category",
       "skin_tone_and_texture": "skin tone description; '' if non-human",
       "facial_features": "notable facial features, including eye shape/color, hair color/style, lip shape, wrinkles, moles, scars, freckles, facial hair, and other visible fine-grained facial attributes; '' if non-human or not visible",
@@ -71,7 +87,7 @@ JSON Schema to complete:
   "cinematography": {
     "framing": "shot type",
     "camera_angle": "angle (e.g., 'Eye-level', 'Low angle', 'High angle')",
-    "depth_of_field": "'Shallow', 'Deep', 'Uniform focus', or 'N/A'",
+    "depth_of_field": "Deep",
     "focus": "what is in sharp focus",
     "lens_focal_length": "descriptive focal length"
   },
@@ -111,4 +127,6 @@ Rules for the Final Narrative:
 - Faithfulness: Only describe what is actually visible in the provided image. Do not hallucinate or invent details not present in the image.
 
 Before finishing, verify that BOTH sections are present and non-empty, and that all four tags are spelled exactly as shown above.
+Check cinematography.depth_of_field separately: its entire value must equal "Shallow", "Deep", "Uniform focus", or "N/A". Keep any explanation exclusively in cinematography.focus. Perform this check silently; do not output the check.
+Check gender in EVERY subjects item, including background groups: its entire value must equal "Male", "Female", "Unknown", or "N/A". If a group would require "Mixed", split it into subjects with allowed values before answering. Perform this check silently; do not output the check.
 Your response must end with </comprehensive_t2i_caption>.
