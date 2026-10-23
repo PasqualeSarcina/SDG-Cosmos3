@@ -40,9 +40,8 @@ The "Deep" value in the template below is a valid example; choose the appropriat
 STRICT RULE FOR subjects[*].gender:
 Every subject, including every subject group, must use exactly one of: "Male", "Female", "Unknown", "N/A".
 Use "N/A" for cars, other non-human subjects and inapplicable cases. Use "Unknown" for humans whose gender cannot be determined from visible details; do not guess.
-When a human group contains visibly different genders, describe the people individually or split them into separate subject groups, each with one allowed gender value. Keep any description of the overall group in description or relationship.
+When a human group contains visibly different genders, use "Unknown".
 "Mixed" is never a valid gender value. Do not combine labels or append explanations.
-The "N/A" value in the template below is a valid example; select the appropriate allowed value for each subject.
 
 JSON Schema to complete:
 {
