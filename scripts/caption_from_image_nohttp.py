@@ -50,6 +50,8 @@ class Args:
     """Independent images generated together on the selected GPUs."""
     max_workers: Annotated[int, tyro.conf.arg(aliases=["--max_workers"])] = 4
     """CPU threads for reading images, not concurrent generation calls."""
+    max_tokens: Annotated[int, tyro.conf.arg(aliases=["--max_tokens"])] = 8192
+    """Maximum new tokens per caption, within the model's available context."""
     max_retries: Annotated[int, tyro.conf.arg(aliases=["--max_retries"])] = 3
     """Maximum attempts per image, including format-validation failures."""
     gpu_memory_utilization: Annotated[float, tyro.conf.arg(aliases=["--gpu_memory_utilization"])] = 0.8
@@ -76,7 +78,7 @@ class Args:
     description_fields: set[str] = field(init=False, default_factory=set, repr=False)
 
     def __post_init__(self) -> None:
-        for name in ("batch_size", "max_workers", "max_retries"):
+        for name in ("batch_size", "max_workers", "max_tokens", "max_retries"):
             if getattr(self, name) < 1:
                 raise ValueError(f"--{name.replace('_', '-')} must be >= 1.")
         if self.spec_draft_n_max < 0:
@@ -183,6 +185,7 @@ class VLLMCaptioner:
             # Logging
             disable_log_stats=not args.debug,
             generation_config="auto",
+            override_generation_config={"max_new_tokens": args.max_tokens},
             speculative_config=(
                 {
                     "method": "mtp",
@@ -215,7 +218,7 @@ class VLLMCaptioner:
         requests = [{"prompt": text, "multi_modal_data": {"image": image}}
                     for text, image in zip(texts, images)]
         sampling_params = self.sampling_params_class.from_optional(
-            n=1,
+            n=1, max_tokens=self.args.max_tokens,
             temperature=self.args.temperature, top_p=self.args.top_p,
             top_k=self.args.top_k, min_p=self.args.min_p,
             presence_penalty=self.args.presence_penalty,
@@ -280,7 +283,11 @@ def _save_caption(args: Args, path: Path, completion: CompletionOutput, size: tu
             encoding="utf-8",
         )
     if completion.finish_reason == "length":
-        raise ValueError("Caption was truncated; increase token budget.")
+        raise ValueError(
+            f"Caption was truncated after {len(completion.token_ids)} tokens "
+            f"(max_tokens={args.max_tokens}); increase --max-tokens "
+            "and ensure the model context has room for the input and output."
+        )
     if completion.finish_reason != "stop":
         raise ValueError(f"Completion did not finish normally: {completion.finish_reason!r}.")
     data = _caption_data(args, completion.text, size)
