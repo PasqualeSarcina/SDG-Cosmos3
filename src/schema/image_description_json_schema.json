@@ -1,0 +1,279 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Image description",
+  "description": "Structured visual description of an image.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "subjects",
+    "subject_details",
+    "background_setting",
+    "lighting",
+    "aesthetics",
+    "cinematography",
+    "style_medium",
+    "artistic_style",
+    "context",
+    "text_and_signage_elements",
+    "quadrant_scan"
+  ],
+  "properties": {
+    "subjects": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "description",
+          "appearance_details",
+          "relationship",
+          "location",
+          "relative_size",
+          "orientation",
+          "pose",
+          "clothing",
+          "expression",
+          "gender",
+          "age",
+          "skin_tone_and_texture",
+          "facial_features",
+          "number_of_subjects",
+          "number_of_arms",
+          "number_of_legs",
+          "number_of_hands",
+          "number_of_fingers"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Full visual description of the subject."
+          },
+          "appearance_details": {
+            "type": "string",
+            "description": "Additional visual details, including accessories, texture and distinguishing features."
+          },
+          "relationship": {
+            "type": "string",
+            "description": "How this subject relates to others or to the scene."
+          },
+          "location": {
+            "type": "string",
+            "description": "Where in frame, e.g. 'Center foreground' or 'Top right'."
+          },
+          "relative_size": {
+            "type": "string",
+            "description": "Size within frame."
+          },
+          "orientation": {
+            "type": "string",
+            "description": "Direction the subject faces relative to the camera."
+          },
+          "pose": {
+            "type": "string",
+            "description": "Body position and posture."
+          },
+          "clothing": {
+            "type": "string",
+            "description": "Clothing and accessories; empty string if non-human or not applicable."
+          },
+          "expression": {
+            "type": "string",
+            "description": "Facial expression; empty string if non-human or not applicable."
+          },
+          "gender": {
+            "type": "string",
+            "enum": ["Male", "Female", "Unknown", "N/A"]
+          },
+          "age": {
+            "type": "string",
+            "description": "Age category."
+          },
+          "skin_tone_and_texture": {
+            "type": "string",
+            "description": "Skin tone description; empty string if non-human."
+          },
+          "facial_features": {
+            "type": "string",
+            "description": "Notable facial features, including eye shape/color, hair color/style, lip shape, wrinkles, moles, scars, freckles, facial hair and other visible fine-grained facial attributes; empty string if non-human or not visible."
+          },
+          "number_of_subjects": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Total in this subject group; 0 if not applicable."
+          },
+          "number_of_arms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of arms; 2 for humans, 0 if non-human."
+          },
+          "number_of_legs": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of legs; 2 for humans, 0 if non-human."
+          },
+          "number_of_hands": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of hands; 2 for humans, 0 if non-human."
+          },
+          "number_of_fingers": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of fingers; 10 for humans, 0 if non-human."
+          }
+        }
+      }
+    },
+    "subject_details": {
+      "type": "object",
+      "description": "Free-form image-specific attributes with keys that vary by image content; empty object if not applicable.",
+      "additionalProperties": {"type": "string"}
+    },
+    "background_setting": {
+      "type": "string",
+      "description": "Full prose description of the environment and setting."
+    },
+    "lighting": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["conditions", "direction", "shadows", "illumination_effect"],
+      "properties": {
+        "conditions": {
+          "type": "string",
+          "description": "Type and quality of light."
+        },
+        "direction": {
+          "type": "string",
+          "description": "Where light comes from; 'None' for flat digital images."
+        },
+        "shadows": {
+          "type": "string",
+          "description": "Shadow description; 'None' for flat digital images."
+        },
+        "illumination_effect": {
+          "type": "string",
+          "description": "Overall effect of the lighting."
+        }
+      }
+    },
+    "aesthetics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["composition", "color_scheme", "mood_atmosphere", "patterns"],
+      "properties": {
+        "composition": {
+          "type": "string",
+          "description": "Framing and compositional choices."
+        },
+        "color_scheme": {
+          "type": "string",
+          "description": "Dominant colors and palette."
+        },
+        "mood_atmosphere": {
+          "type": "string",
+          "description": "Emotional atmosphere in short phrases."
+        },
+        "patterns": {
+          "type": "string",
+          "description": "Notable repeating visual patterns; 'None' if none."
+        }
+      }
+    },
+    "cinematography": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["framing", "camera_angle", "depth_of_field", "focus", "lens_focal_length"],
+      "properties": {
+        "framing": {
+          "type": "string",
+          "description": "Shot type."
+        },
+        "camera_angle": {
+          "type": "string",
+          "description": "Camera angle, e.g. 'Eye-level', 'Low angle' or 'High angle'."
+        },
+        "depth_of_field": {
+          "type": "string",
+          "enum": ["Shallow", "Deep", "Uniform focus", "N/A"]
+        },
+        "focus": {
+          "type": "string",
+          "description": "What is in sharp focus."
+        },
+        "lens_focal_length": {
+          "type": "string",
+          "description": "Descriptive focal length."
+        }
+      }
+    },
+    "style_medium": {
+      "type": "string",
+      "description": "Visual medium, e.g. 'Photography', 'Digital presentation slide' or 'Screenshot'."
+    },
+    "artistic_style": {
+      "type": "string",
+      "description": "Genre or approach."
+    },
+    "context": {
+      "type": "string",
+      "description": "Brief scene context or use case."
+    },
+    "text_and_signage_elements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["text", "category", "appearance", "spatial", "context"],
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The visible text content."
+          },
+          "category": {
+            "type": "string",
+            "enum": ["physical_in_scene", "ui_text", "body_text", "scene_sign", "logo", "label"]
+          },
+          "appearance": {
+            "type": "string",
+            "description": "Font, color, size and style."
+          },
+          "spatial": {
+            "type": "string",
+            "description": "Position in image."
+          },
+          "context": {
+            "type": "string",
+            "description": "Purpose or meaning of the text."
+          }
+        }
+      }
+    },
+    "quadrant_scan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["top_left", "top_right", "bottom_left", "bottom_right", "absolute_center"],
+      "properties": {
+        "top_left": {
+          "type": "string",
+          "description": "Description of what appears in the top-left region."
+        },
+        "top_right": {
+          "type": "string",
+          "description": "Description of what appears in the top-right region."
+        },
+        "bottom_left": {
+          "type": "string",
+          "description": "Description of what appears in the bottom-left region."
+        },
+        "bottom_right": {
+          "type": "string",
+          "description": "Description of what appears in the bottom-right region."
+        },
+        "absolute_center": {
+          "type": "string",
+          "description": "Description of what appears at the center."
+        }
+      }
+    }
+  }
+}
