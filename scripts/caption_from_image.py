@@ -26,6 +26,7 @@ from src.request.client import chat_completion, create_client, resolve_model, ru
 from src.request.response_errors import response_content
 from src.request.response_parsing import parse_json_response
 from src.validation.t2i_schema import t2i_template_to_json_schema
+from src.validation.scene_draft import validate_scene_draft
 
 IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp"]
 log = logging.getLogger(__name__)
@@ -193,6 +194,9 @@ async def _process_single(
                 raise ValueError("Missing or empty <comprehensive_t2i_caption> tag or JSON field")
             if scene_draft is None:
                 raise ValueError("Invalid scene_draft JSON")
+            validate_scene_draft(
+                scene_draft, allow_caption_field=extract_xml_tag(text, "scene_draft") is None,
+            )
 
         if not args.enforce_cosmos_format:
             data = parse_json_response(text)

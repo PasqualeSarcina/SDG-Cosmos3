@@ -24,13 +24,9 @@ _PACKAGE_DIR = Path(__file__).resolve().parents[1]
 if not __package__:
     sys.path.insert(0, str(_PACKAGE_DIR))
 
-from src.caption.structured_caption import (
-    assemble_caption_json,
-    extract_xml_tag,
-    media_fields_from_metadata,
-    parse_structured_caption,
-)
+from src.caption.structured_caption import extract_xml_tag
 from src.request.response_parsing import parse_json_response
+from src.validation.scene_draft import validate_scene_draft
 
 log = logging.getLogger(__name__)
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -43,7 +39,7 @@ class Args:
     input: Annotated[Path, tyro.conf.arg(aliases=["-i"])]
     """Image file or directory; subdirectories are ignored."""
     output: Annotated[Path, tyro.conf.arg(aliases=["-o"])]
-    """Write one <original-image-stem>.json per image."""
+    """Write one <original-image-stem>.xml per image after validating the response."""
     model: str = "Qwen/Qwen3.8-27B"
     """Local VLM checkpoint directory or Hugging Face ID; missing files are downloaded and cached."""
     batch_size: Annotated[int, tyro.conf.arg(aliases=["--batch_size"])] = 32
@@ -68,14 +64,11 @@ class Args:
     """Additive penalty for tokens already generated in this caption, excluding the prompt."""
     repetition_penalty: Annotated[float, tyro.conf.arg(aliases=["--repetition_penalty"])] = 1.0
     prompt_template_path: Annotated[Path | None, tyro.conf.arg(aliases=["--prompt_template_path"])] = Path(_PACKAGE_DIR, "src", "templates", "cosmos_image_captioner.txt")
-    """Custom UTF-8 instruction; otherwise use the template for the selected format."""
-    enforce_cosmos_format: Annotated[bool, tyro.conf.arg(aliases=["--enforce_cosmos_format"])] = True
-    """Expect Cosmos XML/JSON; disable for the flat description JSON schema."""
+    """Custom UTF-8 instruction; otherwise use the Cosmos image captioner template."""
     debug: bool = False
     """Enable verbose logs and save generated text and token counts under output/debug/."""
     image_items: list[Path] = field(init=False, repr=False)
     prompt_template: str = field(init=False, repr=False)
-    description_fields: set[str] = field(init=False, default_factory=set, repr=False)
 
     def __post_init__(self) -> None:
         for name in ("batch_size", "max_workers", "max_tokens", "max_retries"):
@@ -119,22 +112,10 @@ class Args:
             if path.stem.casefold() in names:
                 raise ValueError(f"Ambiguous original image name: {path.stem!r}.")
             names.add(path.stem.casefold())
-        template_name = "cosmos_image_captioner.txt" if self.enforce_cosmos_format else "simple_captioner.txt"
-        template_path = Path(self.prompt_template_path or _PACKAGE_DIR / "src/templates" / template_name)
+        template_path = Path(self.prompt_template_path or _PACKAGE_DIR / "src/templates/cosmos_image_captioner.txt")
         self.prompt_template = template_path.read_text(encoding="utf-8-sig")
         if not self.prompt_template.strip():
             raise ValueError(f"Prompt template file is empty: {template_path}")
-        if not self.enforce_cosmos_format:
-            template = json.loads(
-                (_PACKAGE_DIR / "src/schema/description_json_schema.json").read_text(encoding="utf-8-sig")
-            )
-            self.description_fields = set(template)
-            # Inference stays local; JSON is validated after generation.
-            self.prompt_template += (
-                "\nReturn only a JSON object with exactly the following keys, all values strings. "
-                "This specification takes precedence over any conflicting example above:\n"
-                + json.dumps(template, ensure_ascii=False)
-            )
 
 
 class VLLMCaptioner:
@@ -251,28 +232,23 @@ def _read_image(path: Path) -> Image.Image | Exception:
         return exc
 
 
-def _caption_data(args: Args, text: str, size: tuple[int, int]) -> dict:
+def _validate_caption(text: str) -> None:
+    """Require both Cosmos sections and validate the complete scene JSON."""
     if not text.strip():
         raise ValueError("The model generated an empty caption.")
-    if not args.enforce_cosmos_format:
-        data = parse_json_response(text)
-        if not isinstance(data, dict) or set(data) != args.description_fields:
-            raise ValueError("Caption must contain exactly the description schema fields.")
-        if any(not isinstance(value, str) for value in data.values()):
-            raise ValueError("Description schema fields must be strings.")
-        return data
     narrative = extract_xml_tag(text, "comprehensive_t2i_caption")
-    scene = parse_structured_caption(text)
-    if narrative is None and scene is not None and extract_xml_tag(text, "scene_draft") is None:
-        narrative = scene.get("comprehensive_t2i_caption")
     if not isinstance(narrative, str) or not narrative.strip():
-        raise ValueError("Missing or empty comprehensive_t2i_caption tag or JSON field.")
-    if scene is None:
+        raise ValueError("Missing or empty <comprehensive_t2i_caption> tag.")
+    scene_text = extract_xml_tag(text, "scene_draft")
+    if not scene_text:
+        raise ValueError("Missing or empty <scene_draft> tag.")
+    scene = parse_json_response(scene_text)
+    if not isinstance(scene, dict):
         raise ValueError("Invalid scene_draft JSON.")
-    return assemble_caption_json(scene, narrative, media_fields_from_metadata(size))
+    validate_scene_draft(scene)
 
 
-def _save_caption(args: Args, path: Path, completion: CompletionOutput, size: tuple[int, int], attempt: int) -> None:
+def _save_caption(args: Args, path: Path, completion: CompletionOutput, attempt: int) -> None:
     if args.debug:
         debug_dir = args.output / "debug"
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -290,10 +266,10 @@ def _save_caption(args: Args, path: Path, completion: CompletionOutput, size: tu
         )
     if completion.finish_reason != "stop":
         raise ValueError(f"Completion did not finish normally: {completion.finish_reason!r}.")
-    data = _caption_data(args, completion.text, size)
+    _validate_caption(completion.text)
     args.output.mkdir(parents=True, exist_ok=True)
-    (args.output / f"{path.stem}.json").write_text(
-        json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8",
+    (args.output / f"{path.stem}.xml").write_text(
+        completion.text, encoding="utf-8", newline="",
     )
 
 
@@ -333,7 +309,7 @@ def caption_from_image(args: Args) -> list[str]:
                         try:
                             if isinstance(result, Exception):
                                 raise result
-                            _save_caption(args, path, result, image.size, attempt)
+                            _save_caption(args, path, result, attempt)
                         except Exception as exc:
                             log.debug("%s: attempt %d/%d failed: %s", path.name, attempt, args.max_retries, exc,
                                       exc_info=args.debug)
