@@ -46,7 +46,7 @@ class Args:
     """Write one <original-image-stem>.json per image."""
     model: str = "Qwen/Qwen3.8-27B"
     """Local VLM checkpoint directory or Hugging Face ID; missing files are downloaded and cached."""
-    batch_size: Annotated[int, tyro.conf.arg(aliases=["--batch_size"])] = 16
+    batch_size: Annotated[int, tyro.conf.arg(aliases=["--batch_size"])] = 32
     """Independent images generated together on the selected GPUs."""
     max_workers: Annotated[int, tyro.conf.arg(aliases=["--max_workers"])] = 4
     """CPU threads for reading images, not concurrent generation calls."""
@@ -164,6 +164,8 @@ class VLLMCaptioner:
             model=args.model,
             tensor_parallel_size=gpu_count,
             distributed_executor_backend="mp",
+            # Only one image batch is submitted at a time.
+            max_num_seqs=args.batch_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
             language_model_only=False,
             mm_encoder_tp_mode=(
