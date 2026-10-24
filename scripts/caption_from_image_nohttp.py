@@ -46,7 +46,7 @@ class Args:
     """Independent images generated together on the selected GPUs."""
     max_workers: Annotated[int, tyro.conf.arg(aliases=["--max_workers"])] = 4
     """CPU threads for reading images, not concurrent generation calls."""
-    max_tokens: Annotated[int, tyro.conf.arg(aliases=["--max_tokens"])] = 8192
+    max_tokens: Annotated[int, tyro.conf.arg(aliases=["--max_tokens"])] = 3072
     """Maximum new tokens per caption, within the model's available context."""
     max_retries: Annotated[int, tyro.conf.arg(aliases=["--max_retries"])] = 3
     """Maximum attempts per image, including format-validation failures."""
