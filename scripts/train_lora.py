@@ -33,9 +33,10 @@ class Args:
     batch_size: int = 4
     """Direct training batch size per GPU. Gradient accumulation is fixed at 1."""
     eval_batch_size: int = 2
-    epochs: float = 2.0
+    epochs: float | None = None
+    """Maximum epochs; None trains until early stopping unless max_steps is positive."""
     max_steps: int = -1
-    """Positive values override epochs; -1 uses epochs."""
+    """Positive values override epochs; -1 uses epochs or early stopping when epochs=None."""
     learning_rate: float = 5e-5
     warmup_ratio: float = 0.05
     weight_decay: float = 0.01
@@ -48,9 +49,9 @@ class Args:
     lora_rank: int = 16
     lora_alpha: int = 16
     lora_dropout: float = 0.05
-    field_length_exponent: float = 0.5
+    field_length_exponent: float = 0.25
     structure_weight: float = 0.05
-    seed: int = 3407
+    seed: int = 2026
     system_prompt_path: Path | None = None
     """Override src/templates/generate_caption.txt with a UTF-8 file."""
     resume_from_checkpoint: Path | None = None
@@ -82,7 +83,11 @@ class Args:
             raise ValueError("max_steps must be -1 or >= 1.")
         if self.seed < 0:
             raise ValueError("seed must be >= 0.")
-        for name in ("epochs", "learning_rate", "structure_weight"):
+        if self.epochs is not None and (
+            isinstance(self.epochs, bool) or not math.isfinite(self.epochs) or self.epochs <= 0
+        ):
+            raise ValueError("epochs must be None or finite and > 0.")
+        for name in ("learning_rate", "structure_weight"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and > 0.")
@@ -232,6 +237,7 @@ def train_lora(args: Args) -> dict:
     from src.lora.checkpointing import RecoveryCheckpointCallback
     from src.lora.trainer import Trainer
 
+    early_stopping_only = args.epochs is None and args.max_steps < 0
     config = SFTConfig(
         output_dir=str(output_dir),
         run_name=args.run_name or output_dir.name,
@@ -239,12 +245,14 @@ def train_lora(args: Args) -> dict:
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=1,
-        num_train_epochs=args.epochs,
-        max_steps=args.max_steps,
+        # Trainer requires a finite step budget even when the callback decides
+        # when to stop. This sentinel supplies one without a practical epoch cap.
+        num_train_epochs=args.epochs if args.epochs is not None else 0.0,
+        max_steps=sys.maxsize if early_stopping_only else args.max_steps,
         learning_rate=args.learning_rate,
         warmup_steps=0,
         weight_decay=args.weight_decay,
-        lr_scheduler_type="linear",
+        lr_scheduler_type="constant_with_warmup" if early_stopping_only else "linear",
         optim="adamw_torch",
         bf16=bf16,
         fp16=not bf16,
@@ -276,7 +284,14 @@ def train_lora(args: Args) -> dict:
     # Explicit steps work with both APIs: newer Transformers removed
     # warmup_ratio and interpret warmup_steps >= 1 as an absolute count.
     steps_per_epoch = math.ceil(len(train_dataset) / (args.batch_size * config.world_size))
-    total_steps = args.max_steps if args.max_steps > 0 else math.ceil(args.epochs * steps_per_epoch)
+    # Without a planned end, warm up over a fraction of the first epoch, then
+    # keep the learning rate constant until the early-stopping callback fires.
+    if early_stopping_only:
+        total_steps = steps_per_epoch
+    elif args.max_steps > 0:
+        total_steps = args.max_steps
+    else:
+        total_steps = math.ceil(args.epochs * steps_per_epoch)
     config.warmup_steps = math.ceil(total_steps * args.warmup_ratio)
     trainer = Trainer(
         model=model,
