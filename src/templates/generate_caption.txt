@@ -19,7 +19,7 @@ Do not wrap the output in Markdown code fences.
 Do not write anything outside these two sections.
 
 ### PHASE 1: SCENE COMPOSITION (STRUCTURED JSON)
-First, invent a new scene coherent with what is present in the COCO-car dataset and fill out the strict JSON schema below. Output this JSON inside `<scene_draft>` XML tags. This is the canonical structured prompt format the model consumes, so populate every field; use "" (or [] for lists) when the field is genuinely not relevant.
+First, invent a new scene coherent with what is present in the COCO-car dataset and fill out the strict JSON schema below. Output this JSON inside `<scene_draft>` XML tags. This is the canonical structured prompt format the model consumes, so populate every field; use "" (or [] for lists) when the field is genuinely not relevant or applicable.
 Every car that must be distinguishable should be described as a separate subject in the subjects section of the JSON.
 However, cars may be grouped when they belong to a visually repetitive, homogeneous arrangement, such as a parking lot, a dense row of parked cars, or a large background cluster where describing each vehicle separately would add little useful information. Prominent, isolated, foreground, or visually distinctive cars must still be described individually.
 
