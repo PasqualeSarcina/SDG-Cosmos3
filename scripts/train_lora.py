@@ -225,6 +225,7 @@ def train_lora(args: Args) -> dict:
 
     from trl import SFTConfig
     from transformers import EarlyStoppingCallback
+    from src.lora.checkpointing import RecoveryCheckpointCallback
     from src.lora.trainer import Trainer
 
     config = SFTConfig(
@@ -284,6 +285,7 @@ def train_lora(args: Args) -> dict:
             ),
         ],
     )
+    trainer.add_callback(RecoveryCheckpointCallback(trainer))
     if trainer.is_world_process_zero():
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "run_config.json").write_text(json.dumps({
