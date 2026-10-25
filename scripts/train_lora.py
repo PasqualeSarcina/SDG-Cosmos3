@@ -193,16 +193,7 @@ def load_model(args: Args):
     return model, tokenizer, bf16
 
 
-def train_lora(args: Args) -> dict:
-    output_dir = args.output_dir
-    if args.preflight_only:
-        from transformers import AutoTokenizer
-
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.8-27B", use_fast=True)
-    else:
-        os.environ["WANDB_PROJECT"] = args.wandb_project
-        model, tokenizer, bf16 = load_model(args)
-
+def _prepare_datasets(args: Args, tokenizer):
     from src.lora.collator import CosmosDataCollator
     from src.lora.dataset import load_caption_dataset
 
@@ -220,8 +211,21 @@ def train_lora(args: Args) -> dict:
         summary[name] = {"examples": len(dataset), "min_tokens": min(lengths), "max_tokens": max(lengths)}
         collator([dataset[0]])
         log.info("%s: %d examples, %d-%d tokens", name, len(dataset), min(lengths), max(lengths))
+    return train_dataset, validation_dataset, collator, summary
+
+
+def train_lora(args: Args) -> dict:
     if args.preflight_only:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.8-27B", use_fast=True)
+        _, _, _, summary = _prepare_datasets(args, tokenizer)
         return summary
+
+    output_dir = args.output_dir
+    os.environ["WANDB_PROJECT"] = args.wandb_project
+    model, tokenizer, bf16 = load_model(args)
+    train_dataset, validation_dataset, collator, summary = _prepare_datasets(args, tokenizer)
 
     from trl import SFTConfig
     from transformers import EarlyStoppingCallback
@@ -238,7 +242,7 @@ def train_lora(args: Args) -> dict:
         num_train_epochs=args.epochs,
         max_steps=args.max_steps,
         learning_rate=args.learning_rate,
-        warmup_ratio=args.warmup_ratio,
+        warmup_steps=0,
         weight_decay=args.weight_decay,
         lr_scheduler_type="linear",
         optim="adamw_torch",
@@ -269,6 +273,11 @@ def train_lora(args: Args) -> dict:
         data_seed=args.seed,
         ddp_find_unused_parameters=False,
     )
+    # Explicit steps work with both APIs: newer Transformers removed
+    # warmup_ratio and interpret warmup_steps >= 1 as an absolute count.
+    steps_per_epoch = math.ceil(len(train_dataset) / (args.batch_size * config.world_size))
+    total_steps = args.max_steps if args.max_steps > 0 else math.ceil(args.epochs * steps_per_epoch)
+    config.warmup_steps = math.ceil(total_steps * args.warmup_ratio)
     trainer = Trainer(
         model=model,
         args=config,
