@@ -1,6 +1,7 @@
 """Position-weighted causal loss specified in docs/lora_training_plan.md."""
 
 import inspect
+import math
 import os
 from collections.abc import Mapping
 
@@ -58,6 +59,10 @@ class Trainer(SFTTrainer):
     ):
         self.field_length_exponent = float(field_length_exponent)
         self.structure_weight = float(structure_weight)
+        if not math.isfinite(self.field_length_exponent) or self.field_length_exponent < 0:
+            raise ValueError("field_length_exponent must be finite and >= 0.")
+        if not math.isfinite(self.structure_weight) or self.structure_weight <= 0:
+            raise ValueError("structure_weight must be finite and > 0.")
         # Check for kwargs not compatible with the custom cosmos loss
         if kwargs.get("compute_loss_func") is not None:
             raise ValueError("Trainer implements compute_loss; do not pass compute_loss_func.")
@@ -65,6 +70,8 @@ class Trainer(SFTTrainer):
             raise ValueError("Cosmos loss requires packing=False and padding_free=False.")
         if args.loss_type != "nll" or args.label_smoothing_factor:
             raise ValueError("Cosmos loss requires loss_type='nll' and no label smoothing.")
+        if args.gradient_accumulation_steps != 1:
+            raise ValueError("Cosmos loss requires gradient_accumulation_steps=1.")
         # Default SFT preparation/collation can discard or truncate annotations.
         args.dataset_kwargs = {**(args.dataset_kwargs or {}), "skip_prepare_dataset": True}
         args.remove_unused_columns = False
@@ -252,6 +259,11 @@ class Trainer(SFTTrainer):
         if model.training:
             # DDP averages gradients; our denominator already includes all ranks.
             loss = loss * self.accelerator.num_processes
+        else:
+            # Evaluation gathers/averages losses across ranks, not gradients.
+            # Each rank must report the complete global-batch loss, rather than
+            # its local numerator divided by a global denominator.
+            loss = self._global_stats(numerator.detach()) / denominator.to(numerator)
         return (loss, outputs) if return_outputs else loss
 
     def _record_loss_metrics(self, ce, classes, raw, k):
