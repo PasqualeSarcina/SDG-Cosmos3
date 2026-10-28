@@ -55,8 +55,8 @@ class Args:
     max_retries: Annotated[int, tyro.conf.arg(aliases=["--max_retries"])] = 3
     """Maximum attempts per caption, including the initial attempt."""
     gpu_memory_utilization: Annotated[float, tyro.conf.arg(aliases=["--gpu_memory_utilization"])] = 0.8
-    spec_draft_n_max: int = 1
-    """MTP tokens per step; set to 0 for checkpoints without MTP support."""
+    spec_draft_n_max: int = 0
+    """MTP tokens per step; disabled by default."""
     temperature: float = 0.7
     top_p: Annotated[float, tyro.conf.arg(aliases=["--top_p"])] = 0.8
     top_k: Annotated[int, tyro.conf.arg(aliases=["--top_k"])] = 20
