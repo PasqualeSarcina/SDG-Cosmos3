@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -241,17 +242,25 @@ class VLLMCaptionGenerator:
     def generate(self, count: int) -> list[CompletionOutput | Exception]:
         if count < 1:
             return []
-        sampling_params = self.sampling_params_class.from_optional(
-            n=1, max_tokens=self.args.max_tokens,
-            temperature=self.args.temperature, top_p=self.args.top_p,
-            top_k=self.args.top_k, min_p=self.args.min_p,
-            presence_penalty=self.args.presence_penalty,
-            repetition_penalty=self.args.repetition_penalty,
-            ignore_eos=False,
-            skip_special_tokens=True,
-            structured_outputs=self.structured_outputs,
-        )
-        # No per-request fixed seed: repeated prompts must sample independently.
+        # Give each request its own RNG stream, including repeated prompts.
+        seeds: set[int] = set()
+        sampling_params = []
+        for _ in range(count):
+            seed = secrets.randbits(63)
+            while seed in seeds:
+                seed = secrets.randbits(63)
+            seeds.add(seed)
+            sampling_params.append(self.sampling_params_class.from_optional(
+                n=1, max_tokens=self.args.max_tokens,
+                temperature=self.args.temperature, top_p=self.args.top_p,
+                top_k=self.args.top_k, min_p=self.args.min_p,
+                presence_penalty=self.args.presence_penalty,
+                repetition_penalty=self.args.repetition_penalty,
+                ignore_eos=False,
+                skip_special_tokens=True,
+                structured_outputs=self.structured_outputs,
+                seed=seed,
+            ))
         options = {"lora_request": self.lora_request} if self.lora_request is not None else {}
         outputs = self.model.generate(
             [{"prompt": self.prompt} for _ in range(count)],
