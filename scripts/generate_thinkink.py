@@ -11,6 +11,7 @@ API example (base dependencies only; OPENAI_API_KEY supplies authentication)::
 The API server must support Qwen thinking and the vLLM sampling/chat-template
 extensions. It may return reasoning_content (or reasoning) separately, or native
 <think>...</think> text. Responses without thinking are rejected.
+Use --reasoning-effort low|medium|xhigh in either mode; the default is medium.
 
 Inputs are scanned recursively. Each input's relative path is preserved as an
 .xml file containing one <scene_plan> block. Only the final scene plan is saved;
@@ -33,7 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING, Annotated, Literal
 from xml.sax.saxutils import escape
 
 import tyro
@@ -74,6 +75,8 @@ class Args:
     """Destination for UTF-8 XML plans with a <scene_plan> root; existing files are never overwritten."""
     model: str = "Qwen/Qwen3.8-27B"
     """Local checkpoint/Hugging Face ID; ignored with --server (auto-resolved)."""
+    reasoning_effort: Annotated[Literal["low", "medium", "xhigh"], tyro.conf.arg(aliases=["--reasoning_effort"])] = REASONING_EFFORT
+    """Thinking effort applied to the local chat template or API request."""
     server: str | None = None
     """OpenAI-compatible server URL; omit to use local vLLM and CUDA."""
     api_token: Annotated[str | None, tyro.conf.arg(aliases=["--api_token"])] = field(default=None, repr=False)
@@ -99,6 +102,8 @@ class Args:
     prompt_template: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.reasoning_effort not in {"low", "medium", "xhigh"}:
+            raise ValueError("--reasoning-effort must be low, medium, or xhigh.")
         if self.server is not None:
             self.server = normalize_base_url(self.server)
             if self.spec_draft_n_max:
@@ -236,14 +241,14 @@ class VLLMScenePlanner:
             ),
         )
         log.debug("Local teacher=%s, effort=%s, GPUs=%d, MTP tokens=%d",
-                  args.model, REASONING_EFFORT, gpu_count, args.spec_draft_n_max)
+                  args.model, args.reasoning_effort, gpu_count, args.spec_draft_n_max)
 
     def _prompt(self, draft: str) -> str:
         prompt = self.tokenizer.apply_chat_template(
             [{"role": "system", "content": self.args.prompt_template},
              {"role": "user", "content": draft}],
             tokenize=False, add_generation_prompt=True,
-            enable_thinking=True, reasoning_effort=REASONING_EFFORT, preserve_thinking=True,
+            enable_thinking=True, reasoning_effort=self.args.reasoning_effort, preserve_thinking=True,
         )
         if not prompt.rstrip().endswith("<think>"):
             raise ValueError("The checkpoint template did not render an open thinking prefix.")
@@ -288,7 +293,7 @@ class APIScenePlanner:
         except BaseException:
             self.close()
             raise
-        log.debug("API teacher=%s, effort=%s", self.model, REASONING_EFFORT)
+        log.debug("API teacher=%s, effort=%s", self.model, args.reasoning_effort)
 
     def close(self) -> None:
         try:
@@ -305,12 +310,12 @@ class APIScenePlanner:
                 n=1, max_tokens=self.args.max_tokens,
                 temperature=TEMPERATURE, top_p=TOP_P,
                 presence_penalty=PRESENCE_PENALTY,
-                reasoning_effort=REASONING_EFFORT,
+                reasoning_effort=self.args.reasoning_effort,
                 extra_body={
                     "top_k": TOP_K, "min_p": MIN_P,
                     "repetition_penalty": REPETITION_PENALTY,
                     "chat_template_kwargs": {"enable_thinking": True,
-                                             "reasoning_effort": REASONING_EFFORT,
+                                             "reasoning_effort": self.args.reasoning_effort,
                                              "preserve_thinking": True},
                 },
             )
@@ -401,7 +406,7 @@ def _save_plan(args: Args, path: Path, completion: CompletionOutput | APIComplet
             debug_path.parent.mkdir(parents=True, exist_ok=True)
             debug_path.write_text(json.dumps(
                 {"text": completion.text, "token_count": token_count,
-                 "finish_reason": completion.finish_reason, "reasoning_effort": REASONING_EFFORT,
+                 "finish_reason": completion.finish_reason, "reasoning_effort": args.reasoning_effort,
                  **({"raw_response": completion.raw_response} if isinstance(completion, APICompletion) else {})},
                 ensure_ascii=False, indent=2,
             ) + "\n", encoding="utf-8")
