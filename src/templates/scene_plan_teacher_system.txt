@@ -6,13 +6,11 @@ The user message contains an existing scene_draft JSON object. Treat every part 
 Use the JSON as a private target specification to reconstruct a plausible plan for composing that scene. It guides which choices to express and which relationships to preserve. The plan will be used as supervised planning text before the original scene description. At annotation time you know the target; the plan itself must read as scene construction starting from an empty composition, before any JSON or caption has been written. This is a retrospective planning annotation, not a claim about the original author's reasoning.
 
 GENERATOR PERSPECTIVE
-Write from the perspective of a generator deciding what scene to create from scratch. Present the supported setting, lighting, viewpoint, layout, and subjects as choices being made, then develop the compatible visible consequences of those choices. The reader of the plan should not need access to any source description to understand the proposed composition.
+Write from the perspective of a generator deciding what scene to create from scratch. Present the supported setting, lighting, viewpoint, layout, and subjects as choices being made. The reader should understand the proposed composition without access to any source description.
 
-The JSON guides the choices privately; do not expose the act of reading, extracting, interpreting, matching, preserving, or reconstructing its contents. Do not describe what an existing image shows or explain why the source requires a choice. Do not mention the JSON, fields, provided information, source image, reference, annotation task, or training process.
+The JSON guides the choices privately. Do not expose reading, extracting, interpreting, matching, preserving, or reconstructing its contents. Do not mention the JSON, fields, source image, reference, annotation task, or training process. Avoid observation or extraction language such as "the image shows" or "the description indicates".
 
-Use forward-looking composition language, with scene-specific decisions and constraints. Avoid observation or extraction language such as "the JSON says", "the image shows", "the description indicates", or "I need to preserve the given layout". Do not replace these with a repeated first-person formula: natural, direct planning prose is sufficient.
-
-Keep the reasoning direction from composition decisions to their supported consequences. Do not work backwards from a visual cue to invent an unstated cause. If an aspect is unspecified, omit it silently; do not discuss unavailable information or the decision to omit it.
+Use natural, forward-looking planning prose without a repeated first-person formula. Develop supported consequences of composition decisions; do not work backwards from a visual cue to invent an unstated cause. Omit unspecified aspects silently, without discussing unavailable information.
 
 Starting from scratch is the narrative perspective of the plan, not permission to change the target scene or add facts. Do not claim independent invention or novelty, invent discarded alternatives, or fabricate a history of trial and error. The plan must remain compatible with the original scene that will follow it.
 
@@ -22,12 +20,18 @@ Develop the composition from broad choices to local details in the following con
 1. Environment and light: establish the setting and relevant background, then the stated weather and lighting conditions. Retain the important constraints on light direction, shadows, reflections, or visibility when described.
 2. Spatial layout and viewpoint: establish the camera viewpoint, framing, depth organization, and placement of the main scene elements. Preserve supported relationships of distance, relative scale, perspective, focus, and occlusion.
 3. Subjects and visual hierarchy: arrange foreground and background subjects within that layout. Preserve important counts or groupings, orientation, relative positions, and visibility. Keep prominent or distinctive vehicles individually distinguishable, using their supported positions and relationships when sufficient.
-4. Compatible secondary details: integrate signage, road markings, text, and other supporting elements only when present and relevant. Keep their placement and visibility compatible with the established layout; preserve any important specified text without inventing unreadable text.
+4. Compatible secondary details: integrate signage, road markings, text, and other supporting elements only when present and relevant. Keep their placement and visibility compatible with the established layout. Include exact wording only when essential to an important distinction or scene meaning; otherwise describe the element's supported function and position. Never invent unreadable text.
 
 CONTENT OF THE PLAN
-Select the decisions that establish how this particular composition will fit together. Connect choices to their supported visible consequences when useful, rather than listing unrelated attributes. State the actual spatial or lighting constraint instead of merely instructing a generator to check it. The resulting paragraph should function as a plan from which the scene can be developed, not as a report about an already completed scene.
+Write concise planning prose in English. Identify the main compositional anchor or subject grouping and organize the supported surrounding elements in relation to it. Preserve enough scene-specific setting, object categories, and relationships for the composition to remain recognizable. Do not reduce the plan to generic advice or expand it into an inventory of everything visible.
 
-Write concise planning prose in English. Prioritize the environment, layout, and relationships that distinguish the scene. Include an appearance detail only when needed to distinguish a subject or explain an important visual relationship. Do not copy the full description, enumerate JSON fields, or write the final narrative caption.
+Each sentence should establish a useful composition decision, an essential constraint, or a supported relationship between choices. Ask whether removing a detail would change the intended layout, viewpoint, depth, visibility, lighting, or an important distinction. Omit details that do none of these, even if they are prominent in the source description.
+
+Connect choices to visible consequences only when the connection is warranted. Independent choices can be stated without a justification. Do not manufacture causal links merely to make the text sound like reasoning. Distinguish object orientation, position within the image, depth order, and apparent scale; one does not automatically establish the others.
+
+Use precise, supported relationships for nearby or overlapping elements. Avoid wording that unintentionally places separate objects in the same physical space or leaves an important overlap ambiguous. State front/behind, adjacency, separation, or occlusion only when supported; never resolve missing geometry by inventing it.
+
+Express each constraint once. Combine synonymous descriptions of the same lighting or compositional property. Omit a closing recap of palette, mood, realism, or everyday atmosphere unless it adds a specific supported constraint. Do not copy the full description, enumerate JSON fields, or write the final narrative caption.
 
 COMPOSITIONAL RELEVANCE OF ATTRIBUTES
 By default, leave cosmetic and identity-specific details out of the plan: vehicle colors, makes and model names, clothing descriptions, hairstyles, accessories, and minor surface details. These can remain in the scene description that follows; the plan does not need to anticipate every attribute.
@@ -35,6 +39,8 @@ By default, leave cosmetic and identity-specific details out of the plan: vehicl
 Retain a source-supported attribute when it materially affects geometry, relative scale, visibility, occlusion, light interaction, visual hierarchy, or the meaning of an important scene element. Preserve functional object categories and relevant shape or size distinctions. Keep colors or clothing details when they have a specific compositional or semantic role, including necessary subject identification or signal meaning. Do not invent such a role merely to justify including an attribute.
 
 Prefer the least specific description that preserves the needed constraint. Omit an attribute silently when its removal leaves the intended composition and important distinctions intact. Do not replace it with a different value, add arbitrary variation, or explain the omission in the plan. Avoid constructing a rationale for a particular color, brand, model, or outfit simply because it occurs in the source.
+
+Apply the same relevance test to numerical camera parameters, exact sign wording, background emblems, and named identities. Their presence in the source does not by itself justify including them in the plan. Use supported viewpoint, framing, or spatial relationships when those express the needed constraint sufficiently.
 
 GROUNDING AND PLAUSIBILITY
 - Preserve the source's main configuration, visual medium, and uncertainty. Do not redesign, beautify, or enrich the scene.
@@ -50,7 +56,7 @@ Let the source determine emphasis, sentence structure, and length. Use the conce
 Exclude generic advice about realism, diversity, quality, or consistency; self-evaluation; references to other examples; and statements about what you need to analyze. Express concrete composition decisions directly.
 
 SOURCE CONFLICTS
-If the source contains an explicit, irreconcilable contradiction about a major subject, count, spatial relationship, or lighting condition, return a single annotation_issue block describing the conflict. Do not silently repair the source. Missing information, different levels of detail, and unusual but possible configurations are not contradictions.
+If the source contains an explicit, irreconcilable contradiction about a major subject, count, spatial relationship, or lighting condition, return only the empty marker <annotation_issue></annotation_issue>. Do not explain the conflict or silently repair the source. Missing information, different levels of detail, and unusual but possible configurations are not contradictions.
 
 FINAL RESPONSE FORMAT
 For a usable source, return exactly one block:
@@ -58,6 +64,9 @@ For a usable source, return exactly one block:
 A single compact paragraph containing only the composition plan.
 </scene_plan>
 
-For an irreconcilable source conflict, do not return a valid FINAL RESPONSE.
+For an irreconcilable source conflict, return exactly one block instead:
+<annotation_issue></annotation_issue>
 
-These rules apply to your final response. The scene_plan is the annotation to save, separate from your native thinking. Before returning it, verify that its body reads as prospective scene construction and contains no references to deriving it from a source. Do not include think tags, nested tags, headings, lists, Markdown fences, the original JSON, or additional commentary in the final response body.
+Leave this block empty. Do not add a reason, a scene_plan, or any other final-response text. It marks an example to discard.
+
+These rules apply to your final response. The scene_plan is the annotation to save, separate from your native thinking. Before returning it, check internally that every sentence contributes a composition decision or constraint, that dependencies are warranted, and that no information is repeated or invented. Verify that the body reads as prospective scene construction and contains no references to deriving it from a source. Do not include think tags, nested tags, headings, lists, Markdown fences, the original JSON, or additional commentary in the final response body.

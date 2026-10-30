@@ -15,6 +15,8 @@ extensions. It may return reasoning_content (or reasoning) separately, or native
 Inputs are scanned recursively. Each input's relative path is preserved as an
 .xml file containing one <scene_plan> block. Only the final scene plan is saved;
 native thinking is retained in raw responses under output/debug/ with --debug.
+Teacher responses marked <annotation_issue> are skipped without retries or files,
+including debug files, and counted separately from failures.
 """
 
 from __future__ import annotations
@@ -368,39 +370,41 @@ def _parse_plan(raw: str) -> str:
         raise ValueError("Expected only one final <scene_plan> or <annotation_issue> block.")
     kind, body = match.groups()
     body = body.strip()
+    if kind == "annotation_issue":
+        raise AnnotationIssue("Teacher marked the source as unusable.")
     if not body or re.search(r"<[^>]*>|```", body):
         raise ValueError("Empty plan or unexpected markup/chat tokens inside the final block.")
-    if kind == "annotation_issue":
-        raise AnnotationIssue(body)
     if re.search(r"\n\s*\n", body):
         raise ValueError("Scene plan must be a single compact paragraph.")
     words = len(body.split())
-    if words > 256:
-        raise ValueError(f"Scene plan exceeds the 256-word operational limit ({words} words).")
-    if words > 180:
-        log.warning("Scene plan is longer than recommended: %d words.", words)
     return body
 
 
 def _save_plan(args: Args, path: Path, completion: CompletionOutput | APICompletion, attempt: int) -> None:
     token_count = (completion.token_count if isinstance(completion, APICompletion)
                    else len(completion.token_ids))
-    if args.debug:
-        debug_path = args.output / "debug" / path.relative_to(args.input_root)
-        debug_path = debug_path.with_suffix(f".attempt-{attempt}.json")
-        debug_path.parent.mkdir(parents=True, exist_ok=True)
-        debug_path.write_text(json.dumps(
-            {"text": completion.text, "token_count": token_count,
-             "finish_reason": completion.finish_reason, "reasoning_effort": REASONING_EFFORT,
-             **({"raw_response": completion.raw_response} if isinstance(completion, APICompletion) else {})},
-            ensure_ascii=False, indent=2,
-        ) + "\n", encoding="utf-8")
-    if completion.finish_reason == "length":
-        raise ValueError(f"Response truncated at {token_count if token_count is not None else 'unknown'} tokens; increase --max-tokens "
-                         "and ensure the context has room for both input and output.")
-    if completion.finish_reason != "stop":
-        raise ValueError(f"Completion did not finish normally: {completion.finish_reason!r}.")
-    plan = _parse_plan(completion.text)
+    annotation_issue = False
+    try:
+        if completion.finish_reason == "length":
+            raise ValueError(f"Response truncated at {token_count if token_count is not None else 'unknown'} tokens; increase --max-tokens "
+                             "and ensure the context has room for both input and output.")
+        if completion.finish_reason != "stop":
+            raise ValueError(f"Completion did not finish normally: {completion.finish_reason!r}.")
+        plan = _parse_plan(completion.text)
+    except AnnotationIssue:
+        annotation_issue = True
+        raise
+    finally:
+        if args.debug and not annotation_issue:
+            debug_path = args.output / "debug" / path.relative_to(args.input_root)
+            debug_path = debug_path.with_suffix(f".attempt-{attempt}.json")
+            debug_path.parent.mkdir(parents=True, exist_ok=True)
+            debug_path.write_text(json.dumps(
+                {"text": completion.text, "token_count": token_count,
+                 "finish_reason": completion.finish_reason, "reasoning_effort": REASONING_EFFORT,
+                 **({"raw_response": completion.raw_response} if isinstance(completion, APICompletion) else {})},
+                ensure_ascii=False, indent=2,
+            ) + "\n", encoding="utf-8")
     destination = args.plan_path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     # Publish a complete file atomically without replacing existing annotations.
@@ -420,14 +424,15 @@ def _save_plan(args: Args, path: Path, completion: CompletionOutput | APIComplet
 
 
 def generate_thinkink(args: Args) -> list[str]:
-    """Return failed relative XML paths; load one teacher and retry only invalid outputs."""
+    """Return failed XML paths; source issues are skipped without retries or files."""
     _check_output_paths(args)
     failed: list[str] = []
     succeeded = 0
+    skipped = 0
     backend = None
     with ExitStack() as resources, logging_redirect_tqdm(), ThreadPoolExecutor(max_workers=args.max_workers) as pool, tqdm(
         total=len(args.scene_items), desc="Reading drafts", unit="scene", dynamic_ncols=True,
-        mininterval=0.5, postfix={"ok": 0, "failed": 0},
+        mininterval=0.5, postfix={"ok": 0, "skipped": 0, "failed": 0},
     ) as progress:
         for start in range(0, len(args.scene_items), args.batch_size):
             paths = args.scene_items[start:start + args.batch_size]
@@ -445,7 +450,7 @@ def generate_thinkink(args: Args) -> list[str]:
                 if args.server:
                     resources.callback(backend.close)
             progress.set_description("Planning scenes")
-            progress.set_postfix(ok=succeeded, failed=len(failed), refresh=False)
+            progress.set_postfix(ok=succeeded, skipped=skipped, failed=len(failed), refresh=False)
             for attempt in range(1, args.max_retries + 1):
                 if not pending:
                     break
@@ -458,9 +463,12 @@ def generate_thinkink(args: Args) -> list[str]:
                         if isinstance(result, Exception):
                             raise result
                         _save_plan(args, path, result, attempt)
+                    except AnnotationIssue:
+                        skipped += 1
+                        log.info("Skipping source marked annotation_issue: %s", path)
                     except Exception as exc:
-                        # Invalid source reports and disk errors cannot be fixed by resampling.
-                        if isinstance(exc, (AnnotationIssue, OSError)) or attempt == args.max_retries:
+                        # Disk errors cannot be fixed by resampling.
+                        if isinstance(exc, OSError) or attempt == args.max_retries:
                             log.error("Cannot annotate %s (attempt %d): %s", path, attempt, exc)
                             failed.append(path.relative_to(args.input_root).as_posix())
                         else:
@@ -471,9 +479,10 @@ def generate_thinkink(args: Args) -> list[str]:
                     else:
                         succeeded += 1
                     progress.update(1)
-                    progress.set_postfix(ok=succeeded, failed=len(failed), refresh=False)
+                    progress.set_postfix(ok=succeeded, skipped=skipped, failed=len(failed), refresh=False)
                 pending = retry
-    log.warning("Scene plans saved: %d/%d; failed: %d.", succeeded, len(args.scene_items), len(failed))
+    log.warning("Scene plans saved: %d/%d; skipped: %d; failed: %d.",
+                succeeded, len(args.scene_items), skipped, len(failed))
     if failed:
         log.error("Failed XMLs: %s", ", ".join(failed))
     return failed
