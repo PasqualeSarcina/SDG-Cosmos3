@@ -24,7 +24,7 @@ _PACKAGE_DIR = Path(__file__).resolve().parents[1]
 if not __package__:
     sys.path.insert(0, str(_PACKAGE_DIR))
 
-from scripts.prompt_upsampling import JSON_ENSURE_ASCII, _apply_t2i_output_parameters, _OutputParameters
+from src.caption.output_parameters import JSON_ENSURE_ASCII, apply_t2i_output_parameters, OutputParameters
 from src.request.response_parsing import parse_json_response
 from src.validation.scene_draft import cosmos_structural_tag, validate_scene_draft
 
@@ -48,7 +48,7 @@ class Args:
     lora_path: Annotated[str | None, tyro.conf.arg(aliases=["--lora_path"])] = None
     """Optional PEFT LoRA directory or Hugging Face repository, used for all requests."""
     resolution: str = "720"
-    """Resolution tier from prompt_upsampling.RESOLUTION_RATIO_DICT."""
+    """Resolution tier from src.caption.output_parameters.RESOLUTION_RATIO_DICT."""
     aspect_ratio: Annotated[str, tyro.conf.arg(aliases=["--aspect_ratio"])] = "16,9"
     """Canonical aspect ratio: 16,9, 9,16, 1,1, 4,3 or 3,4."""
     batch_size: Annotated[int, tyro.conf.arg(aliases=["--batch_size"])] = 32
@@ -96,7 +96,7 @@ class Args:
             raise ValueError("--model cannot be empty.")
         if self.lora_path is not None and not self.lora_path.strip():
             raise ValueError("--lora-path cannot be empty.")
-        _OutputParameters(self.resolution, self.aspect_ratio)
+        OutputParameters(self.resolution, self.aspect_ratio)
         self.output = Path(self.output)
         _check_output_paths(self)
         template_path = Path(self.prompt_template_path or _PACKAGE_DIR / "src/templates/generate_caption.txt")
@@ -293,7 +293,7 @@ def _caption_json(args: Args, text: str) -> dict:
         raise ValueError("Invalid scene_draft JSON: expected an object.")
     validate_scene_draft(scene)
     scene["comprehensive_t2i_caption"] = sections[2].strip()
-    return _apply_t2i_output_parameters(scene, resolution=args.resolution, aspect_ratio=args.aspect_ratio)
+    return apply_t2i_output_parameters(scene, resolution=args.resolution, aspect_ratio=args.aspect_ratio)
 
 
 def _save_caption(args: Args, index: int, completion: CompletionOutput, attempt: int) -> None:

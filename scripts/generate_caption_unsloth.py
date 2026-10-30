@@ -24,7 +24,7 @@ if not __package__:
 
 # These helpers only serialize/validate files; importing them does not import vLLM.
 from scripts.generate_caption_nohttp import USER_PROMPT, _check_output_paths, _save_caption
-from scripts.prompt_upsampling import _OutputParameters
+from src.caption.output_parameters import OutputParameters
 
 log = logging.getLogger(__name__)
 MODEL_ID = "unsloth/Qwen3.8-27B"
@@ -76,7 +76,7 @@ class Args:
             raise ValueError("--seed must be in [0, 2**32).")
         self.output = Path(self.output)
         _check_output_paths(self)
-        _OutputParameters(self.resolution, self.aspect_ratio)
+        OutputParameters(self.resolution, self.aspect_ratio)
         template = self.prompt_template_path or _PACKAGE_DIR / "src/templates/generate_caption.txt"
         self.prompt_template = Path(template).read_text(encoding="utf-8-sig")
         if not self.prompt_template.strip():

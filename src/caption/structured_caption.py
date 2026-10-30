@@ -140,7 +140,7 @@ def media_fields_from_metadata(meta: tuple[int, int]) -> dict:
     """Build the caption's media fields from :func:`probe_video_metadata` output.
 
     Uses the image's *actual* values (not the canonical generation enums): the
-    enums constrain the upsampler's generation params, not ground-truth captions.
+    enums constrain generation parameters, not ground-truth captions.
     """
     width, height = int(meta[0]), int(meta[1])
     return {
