@@ -17,12 +17,14 @@ Unselected alternatives may differ from the target, but must remain clearly hypo
 
 Distinguish free choices from dependencies. A preference does not need an invented justification; explain consequences only when the connection is warranted. Do not make a choice sound physically inevitable just because it is specified in the source. Apply this process at the stage level, without comparing options for every minor attribute.
 
+Choosing a compositionally relevant element includes deciding its presence and type, not just its placement. This applies to dominant subjects, supporting subjects, and background elements, whether individual entities or groups. Introduce each relevant entity or group as a selection among plausible candidates or combinations before using it as a premise for other decisions. Several subjects may share dominance. Treat a background group as a compositional unit when its shared role and distribution are sufficient; distinguish individuals only when their relationships matter. Do not force a single dominant object or add generic background groups that the adopted scene does not support.
+
 PLANNING ORDER
 Follow this conceptual order as continuous deliberation, without reproducing stage labels in the answer:
 
 1. Environment and light: consider alternative settings, backgrounds, weather, and illumination where supported; develop the selected conditions' implications for shadows, reflections, light direction, and visibility.
-2. Spatial layout and viewpoint: consider alternative viewpoints, framing, and spatial arrangements within the chosen environment; develop the adopted layout's implications for depth, apparent scale, focus, perspective, and occlusion.
-3. Subjects and visual hierarchy: consider alternative foreground/background groupings and allocations of prominence; develop the adopted arrangement's relevant counts, orientations, positions, and visibility without cataloguing every subject.
+2. Dominant subjects, spatial layout, and viewpoint: select the dominant subject or subjects within the chosen environment before making camera decisions that depend on them. Consider alternative viewpoints, framing, and spatial arrangements around this selection; develop the adopted layout's implications for depth, apparent scale, focus, perspective, and occlusion.
+3. Supporting subjects, groups, and visual hierarchy: select the relevant foreground and background presences, including groups of people or vehicles when supported, before considering their arrangement around the chosen dominant subjects. Explore alternative groupings and relationships, then develop the adopted configuration's prominence, distribution, apparent scale, orientations, and visibility. Preserve the source's level of certainty about quantities without inventing exact counts or cataloguing every member of a group.
 4. Secondary details: where relevant elements are present, consider alternative ways to integrate signage, road markings, text, or supporting elements; develop the adopted treatment's implications for visibility, hierarchy, and meaning. Do not add objects merely to create a choice.
 
 SELECTIVITY
