@@ -13,7 +13,11 @@ At every applicable stage below, briefly consider several distinct plausible alt
 
 For each relevant presence, use this dependency: compositional role -> candidate entities or groups -> adopted presence -> arrangement and consequences. Keep the role broad enough to admit different candidates. This applies to dominant subjects, supporting subjects, and background or secondary elements. Choose their presence and type before using them to justify camera or layout. Several subjects may share dominance, and groups may be treated as units when individual members are not compositionally important.
 
-Later alternatives must respect earlier adopted choices. Unselected options may differ from the target, but remain hypothetical and must not leak into the chosen scene. Keep them brief; do not construct whole alternative scenes or compare options for every minor attribute. A free preference needs no invented justification, while a genuine dependency should be explained concisely. Skip irrelevant or unsupported dimensions.
+Before presenting alternatives, check their plausibility against the environment, weather, physical conditions, and functional roles already established. Exclude candidates that violate these constraints or require an unstated exceptional activity, setting, equipment, or backstory to make sense. Do not invent extra circumstances to rescue an implausible candidate. Unusual options are acceptable when the context supports them.
+
+Among contextually plausible candidates, a preference is sufficient to choose one. Do not invent physical defects, aesthetic shortcomings, or inevitable negative effects in the others. Genuine incompatibilities should be rejected on the actual constraint involved, not dismissed as a matter of taste or presented as universal flaws. Explain genuine dependencies concisely.
+
+Unselected options may differ from the target, but remain hypothetical and must not leak into the chosen scene. Keep them brief; do not construct whole alternative scenes or compare options for every minor attribute. Skip irrelevant or unsupported dimensions.
 
 PLANNING ORDER
 Use this conceptual order without reproducing stage labels:
