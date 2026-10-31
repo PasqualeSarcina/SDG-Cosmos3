@@ -12,6 +12,8 @@ The API server must support Qwen thinking and the vLLM sampling/chat-template
 extensions. It may return reasoning_content (or reasoning) separately, or native
 <think>...</think> text. Responses without thinking are rejected.
 Use --reasoning-effort low|medium|xhigh in either mode; the default is medium.
+With --server, --batch-size controls API concurrency; --max-workers only controls
+the CPU threads used to read XML files.
 
 Inputs are scanned recursively. Each input's relative path is preserved as an
 .xml file containing one <scene_plan> block. Only the final scene plan is saved;
@@ -84,8 +86,9 @@ class Args:
     timeout_s: float = 300.0
     """API request timeout in seconds."""
     batch_size: Annotated[int, tyro.conf.arg(aliases=["--batch_size"])] = 32
+    """Scenes per generation group; also the maximum concurrent API requests with --server."""
     max_workers: Annotated[int, tyro.conf.arg(aliases=["--max_workers"])] = 4
-    """Threads for reading XMLs; also limits concurrent requests in API mode."""
+    """CPU threads for reading XMLs; does not limit API concurrency."""
     max_tokens: Annotated[int, tyro.conf.arg(aliases=["--max_tokens"])] = 8192
     """Maximum new tokens per response, including native thinking and final plan."""
     max_retries: Annotated[int, tyro.conf.arg(aliases=["--max_retries"])] = 3
@@ -344,7 +347,7 @@ class APIScenePlanner:
 
     def generate(self, drafts: list[str]) -> list[APICompletion | Exception]:
         async def generate_batch() -> list[APICompletion | Exception]:
-            semaphore = asyncio.Semaphore(self.args.max_workers)
+            semaphore = asyncio.Semaphore(self.args.batch_size)
 
             async def generate_limited(draft: str) -> APICompletion | Exception:
                 async with semaphore:
