@@ -55,7 +55,6 @@ from src.validation.scene_draft import validate_scene_draft
 from src.request.client import create_client, normalize_base_url, resolve_model
 
 log = logging.getLogger(__name__)
-REASONING_EFFORT = "medium"
 # Fixed Qwen3.8-27B thinking-mode sampling recommendations:
 # https://huggingface.co/Qwen/Qwen3.8-27B#best-practices
 TEMPERATURE = 1.0
@@ -77,13 +76,13 @@ class Args:
     """Destination for UTF-8 XML plans with a <scene_plan> root; existing files are never overwritten."""
     model: str = "Qwen/Qwen3.8-27B"
     """Local checkpoint/Hugging Face ID; ignored with --server (auto-resolved)."""
-    reasoning_effort: Annotated[Literal["low", "medium", "xhigh"], tyro.conf.arg(aliases=["--reasoning_effort"])] = REASONING_EFFORT
+    reasoning_effort: Annotated[Literal["low", "medium", "xhigh"], tyro.conf.arg(aliases=["--reasoning_effort"])] = "xhigh"
     """Thinking effort applied to the local chat template or API request."""
     server: str | None = None
     """OpenAI-compatible server URL; omit to use local vLLM and CUDA."""
     api_token: Annotated[str | None, tyro.conf.arg(aliases=["--api_token"])] = field(default=None, repr=False)
     """API key; defaults to OPENAI_API_KEY, or EMPTY for an unauthenticated server."""
-    timeout_s: float = 300.0
+    timeout_s: float = 900.0
     """API request timeout in seconds."""
     batch_size: Annotated[int, tyro.conf.arg(aliases=["--batch_size"])] = 32
     """Scenes per generation group; also the maximum concurrent API requests with --server."""
