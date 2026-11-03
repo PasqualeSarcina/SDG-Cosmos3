@@ -9,6 +9,7 @@ import os
 import sys
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import Literal
 
 import tyro
 
@@ -22,13 +23,19 @@ log = logging.getLogger(__name__)
 
 @dataclass
 class Args:
+    """Train on captions; supply both --train-plans and --validation-plans to supervise thinking."""
+
     train: list[Path]
-    """Training files or directories, already split by image origin/group."""
+    """Training caption files or directories, scanned recursively. Split by origin/group beforehand."""
     validation: list[Path]
-    """Validation files or directories, separate from training."""
+    """Validation caption files or directories, separate from training."""
+    train_plans: Path | None = None
+    """Training plan directory mirroring --train. Supply together with --validation-plans to enable thinking."""
+    validation_plans: Path | None = None
+    """Validation plan directory mirroring --validation; same relative paths as the captions in this split."""
     output_dir: Path = Path("checkpoints/cosmos-lora")
-    """Checkpoints and metrics directory; the final adapter goes in adapter/."""
-    max_length: int = 6144
+    """Destination for checkpoints and metrics; final adapter in adapter/. Independent of plan inputs."""
+    max_length: int = 12288
     """Maximum complete chat length. Oversized examples fail rather than truncate."""
     batch_size: int = 4
     """Direct training batch size per GPU. Gradient accumulation is fixed at 1."""
@@ -42,7 +49,7 @@ class Args:
     weight_decay: float = 0.01
     logging_steps: int = 10
     save_total_limit: int = 2
-    early_stopping_patience: int = 3
+    early_stopping_patience: int = 4
     """Stop after this many evaluations without improvement in validation loss."""
     early_stopping_threshold: float = 0.001
     """Minimum absolute validation-loss improvement that resets early stopping."""
@@ -51,6 +58,12 @@ class Args:
     lora_dropout: float = 0.05
     field_length_exponent: float = 0.25
     structure_weight: float = 0.05
+    thinking_weight: float = 1.0
+    """Per-token plan weight when both plan directories are supplied; otherwise unused."""
+    response_weight: float = 0.5
+    """Multiplier of final-response C/D/S weights with plans; otherwise unused."""
+    model_revision: str | None = None
+    """Optional pinned base-model/tokenizer revision; record it in the training contract."""
     seed: int = 2026
     system_prompt_path: Path | None = None
     """Override src/templates/generate_caption.txt with a UTF-8 file."""
@@ -60,11 +73,17 @@ class Args:
     wandb_project: str = "sdg-cosmos3"
     preflight_only: bool = False
     """Load only the tokenizer and validate both datasets, without training."""
+    thinking_mode: Literal["off", "supervised"] = field(init=False)
+    caption_roots: dict[str, Path] = field(init=False, repr=False)
     train_paths: list[Path] = field(init=False, repr=False)
     validation_paths: list[Path] = field(init=False, repr=False)
     system_prompt: str = field(init=False, repr=False)
 
     def __post_init__(self):
+        if (self.train_plans is None) != (self.validation_plans is None):
+            raise ValueError("Supply both --train-plans and --validation-plans, or omit both to train without thinking.")
+        self.thinking_mode = "off" if self.train_plans is None else "supervised"
+        self.caption_roots = {}
         if not self.wandb_project.strip():
             raise ValueError("wandb_project must be nonempty.")
         for name in ("max_length", "batch_size", "eval_batch_size", "max_steps", "logging_steps",
@@ -87,7 +106,7 @@ class Args:
             isinstance(self.epochs, bool) or not math.isfinite(self.epochs) or self.epochs <= 0
         ):
             raise ValueError("epochs must be None or finite and > 0.")
-        for name in ("learning_rate", "structure_weight"):
+        for name in ("learning_rate", "structure_weight", "thinking_weight", "response_weight"):
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and > 0.")
@@ -101,10 +120,26 @@ class Args:
             raise ValueError("run_name must be nonempty when supplied.")
 
         for split in ("train", "validation"):
+            inputs = [Path(source) for source in getattr(self, split)]
+            if not inputs:
+                raise ValueError(f"Supply at least one caption file or directory for --{split}.")
+            if self.thinking_mode == "supervised":
+                from src.lora.thinking_dataset import plan_roots
+
+                # A directory maps directly to the plan directory. For explicit
+                # files/multiple inputs, retain paths from their common parent.
+                anchors = [source.resolve() if source.is_dir() else source.resolve().parent for source in inputs]
+                caption_root = Path(os.path.commonpath(anchors))
+                plan_root = getattr(self, f"{split}_plans")
+                try:
+                    caption_root, plan_root = plan_roots(caption_root, plan_root)
+                except ValueError as error:
+                    raise ValueError(f"--{split} / --{split}-plans: {error}") from error
+                self.caption_roots[split] = caption_root
+                setattr(self, f"{split}_plans", plan_root)
             paths = []
             seen = set()
-            for source in getattr(self, split):
-                source = Path(source)
+            for source in inputs:
                 if source.is_dir():
                     candidates = sorted(
                         path for path in source.rglob("*")
@@ -113,17 +148,23 @@ class Args:
                     )
                 elif source.is_file():
                     candidates = [source]
+                elif self.thinking_mode == "supervised" and source.suffix.lower() in (".xml", ".json", ".txt"):
+                    # Explicit failed generations are accounted for in the
+                    # pairing report, just like absent files in scanned folders.
+                    candidates = [source]
                 else:
                     raise ValueError(f"Caption path does not exist: {source}")
-                if not candidates:
+                if not candidates and self.thinking_mode == "off":
                     raise ValueError(f"No caption files found in {source}.")
                 for path in candidates:
                     path = path.resolve()
+                    if self.thinking_mode == "supervised" and not path.is_relative_to(self.caption_roots[split]):
+                        raise ValueError(f"Caption outside --{split} root: {path}")
                     if path in seen:
                         raise ValueError(f"Repeated caption path: {path}")
                     seen.add(path)
                     paths.append(path)
-            if not paths:
+            if not paths and self.thinking_mode == "off":
                 raise ValueError("Supply at least one caption file or directory per split.")
             setattr(self, f"{split}_paths", paths)
         overlap = set(self.train_paths) & set(self.validation_paths)
@@ -137,6 +178,13 @@ class Args:
             self.resume_from_checkpoint = Path(self.resume_from_checkpoint).resolve()
             if not (self.resume_from_checkpoint / "trainer_state.json").is_file():
                 raise ValueError("resume_from_checkpoint must contain trainer_state.json.")
+            protocol_path = self.resume_from_checkpoint / "thinking_config.json"
+            if protocol_path.is_file():
+                saved = json.loads(protocol_path.read_text(encoding="utf-8"))
+                if saved.get("thinking_mode") != self.thinking_mode:
+                    raise ValueError("Cannot resume a checkpoint from a different thinking_mode.")
+            elif self.thinking_mode == "supervised":
+                raise ValueError("Supervised resume requires thinking_config.json; start a new run from the base model.")
         elif not self.preflight_only and self.output_dir.exists() and any(self.output_dir.iterdir()):
             raise ValueError(
                 f"Output directory is not empty: {self.output_dir}. Choose a new directory or resume a checkpoint."
@@ -175,6 +223,7 @@ def load_model(args: Args):
         return_logits=True,
         fast_inference=False,
         device_map={"": local_rank},
+        **({"revision": args.model_revision} if args.model_revision else {}),
     )
     model = FastModel.get_peft_model(
         model,
@@ -198,7 +247,32 @@ def load_model(args: Args):
     return model, tokenizer, bf16
 
 
-def _prepare_datasets(args: Args, tokenizer):
+def _collect_supervised_pairs(args: Args):
+    if args.thinking_mode != "supervised":
+        return None
+    from src.lora.pairing import collect_caption_plan_pairs
+
+    pairings = {
+        split: collect_caption_plan_pairs(getattr(args, f"{split}_paths"), caption_root=args.caption_roots[split],
+                                          plan_root=getattr(args, f"{split}_plans"), caption_inputs=getattr(args, split))
+        for split in ("train", "validation")
+    }
+    for split, pairing in pairings.items():
+        report = pairing["report"]
+        log.info("%s pairing: %d usable pairs, %d discarded",
+                 split, len(pairing["examples"]), report["discarded"])
+    empty = [split for split, pairing in pairings.items() if not pairing["examples"]]
+    if empty:
+        raise ValueError("No valid plan-caption pairs in " + ", ".join(empty) + "; pairing report: "
+                         + json.dumps({s: p["report"] for s, p in pairings.items()}, ensure_ascii=False))
+    plans = [(getattr(args, f"{split}_plans") / example["record"]["plan"]).resolve()
+             for split, pairing in pairings.items() for example in pairing["examples"]]
+    if len(plans) != len(set(plans)):
+        raise ValueError("Train/validation captions map to the same plan.")
+    return pairings
+
+
+def _prepare_datasets(args: Args, tokenizer, pairings=None):
     from src.lora.collator import CosmosDataCollator
     from src.lora.dataset import load_caption_dataset
 
@@ -207,35 +281,77 @@ def _prepare_datasets(args: Args, tokenizer):
             raise ValueError("The tokenizer must define a padding token or an EOS token.")
         tokenizer.pad_token = tokenizer.eos_token
     options = dict(max_length=args.max_length, system_prompt=args.system_prompt)
-    train_dataset = load_caption_dataset(args.train_paths, tokenizer, **options)
-    validation_dataset = load_caption_dataset(args.validation_paths, tokenizer, **options)
+    audits = {"train": {}, "validation": {}}
+    if args.thinking_mode == "supervised":
+        if pairings is None:
+            pairings = _collect_supervised_pairs(args)
+    datasets = {}
+    for split in ("train", "validation"):
+        split_options = dict(options)
+        if pairings is not None:
+            split_options.update(thinking_mode="supervised", caption_root=args.caption_roots[split],
+                                 plan_root=getattr(args, f"{split}_plans"), pairing=pairings[split])
+        datasets[split] = load_caption_dataset(getattr(args, f"{split}_paths"), tokenizer,
+                                              audit=audits[split], **split_options)
+    train_dataset, validation_dataset = datasets["train"], datasets["validation"]
     collator = CosmosDataCollator(tokenizer, max_length=args.max_length)
     summary = {}
     for name, dataset in (("train", train_dataset), ("validation", validation_dataset)):
         lengths = [len(ids) for ids in dataset["input_ids"]]
         summary[name] = {"examples": len(dataset), "min_tokens": min(lengths), "max_tokens": max(lengths)}
+        if args.thinking_mode == "supervised":
+            from statistics import median
+
+            for segment in ("prefix", "thinking", "answer", "total"):
+                values = sorted(row[segment] for row in audits[name]["lengths"])
+                summary[name][segment + "_tokens"] = dict(
+                    min=values[0], median=median(values), p95=values[math.ceil(.95 * len(values)) - 1], max=values[-1],
+                )
+            summary[name]["mixed_tokens"] = sum(row["mixed_tokens"] for row in audits[name]["lengths"])
+            summary[name]["plans_found"] = len(audits[name]["records"])
+            summary[name]["source_hashes_verified"] = sum(row["source_hash_verified"] for row in audits[name]["records"])
+            summary[name]["pairing"] = audits[name]["pairing"]
         collator([dataset[0]])
         log.info("%s: %d examples, %d-%d tokens", name, len(dataset), min(lengths), max(lengths))
+    from src.lora.training_protocol import check_resume, make_training_protocol
+
+    summary["thinking_config"] = make_training_protocol(args, tokenizer, audits)
+    check_resume(args.resume_from_checkpoint, summary["thinking_config"])
     return train_dataset, validation_dataset, collator, summary
 
 
 def train_lora(args: Args) -> dict:
+    # Audit pair existence and source validity before downloading/loading either
+    # tokenizer or model. Reuse these exact snapshots during preprocessing.
+    pairings = _collect_supervised_pairs(args)
     if args.preflight_only:
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.8-27B", use_fast=True)
-        _, _, _, summary = _prepare_datasets(args, tokenizer)
+        tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3.8-27B", use_fast=True,
+                                                  **({"revision": args.model_revision} if args.model_revision else {}))
+        _, _, _, summary = _prepare_datasets(args, tokenizer, pairings=pairings)
         return summary
 
     output_dir = args.output_dir
     os.environ["WANDB_PROJECT"] = args.wandb_project
     model, tokenizer, bf16 = load_model(args)
-    train_dataset, validation_dataset, collator, summary = _prepare_datasets(args, tokenizer)
+    train_dataset, validation_dataset, collator, summary = _prepare_datasets(args, tokenizer, pairings=pairings)
 
     from trl import SFTConfig
     from transformers import EarlyStoppingCallback
+    from transformers.integrations import WandbCallback
     from src.lora.checkpointing import RecoveryCheckpointCallback
     from src.lora.trainer import Trainer
+    from src.lora.training_protocol import save_training_protocol
+    from src.lora.wandb_tracking import ResumableWandbCallback
+
+    trainer_type, trainer_options = Trainer, {}
+    if args.thinking_mode == "supervised":
+        from src.lora.thinking_trainer import ThinkingTrainer
+
+        trainer_type = ThinkingTrainer
+        trainer_options = dict(thinking_weight=args.thinking_weight, response_weight=args.response_weight,
+                               thinking_protocol=summary["thinking_config"]["protocol"])
 
     early_stopping_only = args.epochs is None and args.max_steps < 0
     config = SFTConfig(
@@ -293,7 +409,7 @@ def train_lora(args: Args) -> dict:
     else:
         total_steps = math.ceil(args.epochs * steps_per_epoch)
     config.warmup_steps = math.ceil(total_steps * args.warmup_ratio)
-    trainer = Trainer(
+    trainer = trainer_type(
         model=model,
         args=config,
         processing_class=tokenizer,
@@ -302,6 +418,8 @@ def train_lora(args: Args) -> dict:
         data_collator=collator,
         field_length_exponent=args.field_length_exponent,
         structure_weight=args.structure_weight,
+        training_protocol=summary["thinking_config"],
+        **trainer_options,
         callbacks=[
             EarlyStoppingCallback(
                 early_stopping_patience=args.early_stopping_patience,
@@ -309,9 +427,16 @@ def train_lora(args: Args) -> dict:
             ),
         ],
     )
+    trainer.pop_callback(WandbCallback)
+    trainer.add_callback(ResumableWandbCallback(args.resume_from_checkpoint))
     trainer.add_callback(RecoveryCheckpointCallback(trainer))
     if trainer.is_world_process_zero():
         output_dir.mkdir(parents=True, exist_ok=True)
+        save_training_protocol(output_dir, summary["thinking_config"])
+        if pairings is not None:
+            (output_dir / "pairing_report.json").write_text(json.dumps(
+                {split: pairing["report"] for split, pairing in pairings.items()},
+                ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         (output_dir / "run_config.json").write_text(json.dumps({
             "model": "Qwen/Qwen3.8-27B", "load_in_4bit": False, "precision": "auto",
             "args": {item.name: getattr(args, item.name) for item in fields(args) if item.init},
@@ -331,6 +456,7 @@ def train_lora(args: Args) -> dict:
     trainer.save_model(str(adapter_dir))
     if trainer.is_world_process_zero():
         tokenizer.save_pretrained(str(adapter_dir))
+        save_training_protocol(adapter_dir, summary["thinking_config"])
     return {"data": summary, "train": result.metrics, "eval": metrics, "adapter_dir": str(adapter_dir)}
 
 

@@ -8,3 +8,4 @@ class TokenClass(IntEnum):
     CONTENT = 1
     DECISION = 2
     STRUCTURE = 3
+    THINKING = 4

@@ -55,8 +55,10 @@ class Trainer(SFTTrainer):
             data_collator,
             field_length_exponent: float,
             structure_weight: float,
+            training_protocol: dict | None = None,
             **kwargs
     ):
+        self.training_protocol = training_protocol
         self.field_length_exponent = float(field_length_exponent)
         self.structure_weight = float(structure_weight)
         if not math.isfinite(self.field_length_exponent) or self.field_length_exponent < 0:
@@ -94,6 +96,17 @@ class Trainer(SFTTrainer):
         base = unwrapped.get_base_model() if hasattr(unwrapped, "get_base_model") else unwrapped
         self._supports_fused_lm_head = "fused_lm_head" in inspect.signature(base.forward, follow_wrapped=False).parameters
         self._cosmos_metrics = {"train": [], "eval": []}
+
+    def save_model(self, output_dir=None, _internal_call=False):
+        super().save_model(output_dir, _internal_call=_internal_call)
+        if self.args.should_save:
+            from src.lora.wandb_tracking import copy_wandb_identity
+
+            copy_wandb_identity(self.args.output_dir, output_dir or self.args.output_dir)
+        if self.training_protocol is not None and self.args.should_save:
+            from src.lora.training_protocol import save_training_protocol
+
+            save_training_protocol(output_dir or self.args.output_dir, self.training_protocol)
 
     def _token_metadata(self, inputs: dict[str, torch.Tensor]):
         """Prepare per-token annotations and raw weights for the Cosmos loss.

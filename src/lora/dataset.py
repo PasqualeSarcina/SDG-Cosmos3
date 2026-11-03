@@ -225,6 +225,8 @@ def prepare_caption(
     system_prompt: str | None = None,
     user_prompt: str = USER_PROMPT,
     response_end_token: str | None = None,
+    thinking_mode: str = "off",
+    scene_plan: str | None = None,
 ) -> PreparedCaption:
     """Build unshifted Trainer features, retaining annotations for inspection.
 
@@ -234,6 +236,15 @@ def prepare_caption(
     A token crossing excluded/supervised spans is an error. Other mixed tokens
     use DECISION > CONTENT > STRUCTURE, and the first touched content field, with an audit record.
     """
+    if thinking_mode == "supervised":
+        from src.lora.thinking_dataset import prepare_planned_caption
+
+        return prepare_planned_caption(
+            caption, tokenizer, scene_plan=scene_plan, max_length=max_length,
+            system_prompt=system_prompt, user_prompt=user_prompt, response_end_token=response_end_token,
+        )
+    if thinking_mode != "off" or scene_plan is not None:
+        raise ValueError("Use thinking_mode='supervised' with a scene plan, or 'off' without one.")
     if not getattr(tokenizer, "is_fast", False):
         raise ValueError("Use a fast tokenizer with character offset mappings.")
     if system_prompt is None:
@@ -350,12 +361,21 @@ def build_dataset(captions: Iterable[Mapping[str, Any]], tokenizer, *, max_lengt
     return Dataset.from_list(rows)
 
 
-def load_caption_dataset(paths: Iterable[str | Path], tokenizer, *, max_length: int, **kwargs):
+def load_caption_dataset(paths: Iterable[str | Path], tokenizer, *, max_length: int,
+                         thinking_mode="off", caption_root=None, plan_root=None, audit=None, **kwargs):
     """Load explicit two-section caption files; never modify sources or silently skip errors.
 
     Pass separate file lists for train/validation. No automatic random split is
     performed because near-duplicates and related images must stay together.
     """
+    if thinking_mode == "supervised":
+        from src.lora.thinking_dataset import load_planned_dataset
+
+        return load_planned_dataset(paths, tokenizer, max_length=max_length,
+                                    caption_root=caption_root, plan_root=plan_root, audit=audit, **kwargs)
+    if thinking_mode != "off" or caption_root is not None or plan_root is not None:
+        raise ValueError("Plan roots require thinking_mode='supervised'.")
+
     def examples():
         for value in paths:
             path = Path(value)
