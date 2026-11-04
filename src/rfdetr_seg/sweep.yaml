@@ -1,0 +1,14 @@
+name: rfdetr-seg-car-from-scratch
+method: random
+metric:
+  name: sweep/best_mask_map
+  goal: maximize
+parameters:
+  lr:
+    distribution: log_uniform_values
+    min: 0.00005
+    max: 0.0005
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.00001
+    max: 0.001
