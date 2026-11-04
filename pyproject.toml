@@ -18,9 +18,17 @@ llm-lora-cu130 = [
     "wandb",
     "vllm",
 ]
+sam = [
+    "numpy",
+    "pycocotools",
+    "torch",
+    "torchvision",
+    "transformers>=5,<6",
+]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
