@@ -76,7 +76,10 @@ def build_module(model_config, train_config):
 
 def configs(config, lr, weight_decay, *, epochs=None):
     cls = getattr(rfconfig, f"RFDETRSeg{config['variant']}Config")
-    model_config = cls(pretrain_weights=None, num_classes=1, num_select=100, resolution=config["resolution"])
+    model_config = cls(
+        pretrain_weights=None, num_classes=1, num_select=100,
+        resolution=config["resolution"], compile=True,
+    )
     if model_config.resolution % (model_config.patch_size * model_config.num_windows):
         raise ValueError("resolution must be divisible by patch_size * num_windows for the selected variant")
     train_config = rfconfig.SegmentationTrainConfig(
@@ -168,8 +171,9 @@ class Evaluation(pl.Callback):
             return
         if self.checkpoint_dir is not None:
             temporary = self.checkpoint_dir / "best.pt.tmp"
+            model = getattr(module.model, "_orig_mod", module.model)
             torch.save({
-                "state_dict": module.model.state_dict(),
+                "state_dict": model.state_dict(),
                 "rfdetr_version": RFDETR_VERSION,
                 "model_config": module.model_config.model_dump(mode="json"),
                 "train_config": module.train_config.model_dump(mode="json"),
@@ -282,7 +286,9 @@ def load_checkpoint(path):
     if checkpoint["rfdetr_version"] != RFDETR_VERSION:
         raise ValueError("Checkpoint requires a different RF-DETR version")
     variant = checkpoint["provenance"]["variant"]
-    model_config = getattr(rfconfig, f"RFDETRSeg{variant}Config").model_validate(checkpoint["model_config"])
+    model_config = getattr(rfconfig, f"RFDETRSeg{variant}Config").model_validate({
+        **checkpoint["model_config"], "compile": False,
+    })
     train_config = rfconfig.SegmentationTrainConfig.model_validate(checkpoint["train_config"])
     module = build_module(model_config, train_config)
     module.model.load_state_dict(checkpoint["state_dict"], strict=True)
