@@ -3,6 +3,10 @@ method: random
 metric:
   name: sweep/best_mask_map
   goal: maximize
+early_terminate:
+  type: hyperband
+  min_iter: 10
+  eta: 3
 parameters:
   lr:
     distribution: log_uniform_values

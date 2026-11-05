@@ -12,6 +12,7 @@ import numpy as np
 from pycocotools import mask as mask_utils
 from pycocotools.cocoeval import COCOeval
 import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping
 from pytorch_lightning.loggers import WandbLogger
 from rfdetr import config as rfconfig
 from rfdetr.models import lwdetr
@@ -28,19 +29,26 @@ from .settings import (
 
 
 class CarModule(RFDETRModelModule):
-    def detections(self, samples, sizes):
+    def evaluation_step(self, batch, *, compute_loss):
+        samples, targets = batch
         outputs = self.model(samples)
+        if compute_loss:
+            loss_dict = self.criterion(outputs, targets)
+            weights = self.criterion.weight_dict
+            loss = sum(value * weights[key] for key, value in loss_dict.items() if key in weights)
+            self._log_val_loss_metrics(loss, loss_dict, batch_size=len(targets))
+
+        sizes = torch.stack([target["orig_size"] for target in targets])
         if outputs["pred_logits"].shape[-1] != 2:
             raise RuntimeError("Expected the car logit (0) and RF-DETR's extra classifier slot (1)")
         outputs["pred_logits"] = outputs["pred_logits"][..., :1].contiguous()
-        return self.postprocess(outputs, sizes)
+        return self.postprocess(outputs, sizes), targets
 
     def validation_step(self, batch, batch_idx):
-        samples, targets = batch
-        sizes = torch.stack([target["orig_size"] for target in targets])
-        return self.detections(samples, sizes), targets
+        return self.evaluation_step(batch, compute_loss=self._should_compute_val_loss)
 
-    test_step = validation_step
+    def test_step(self, batch, batch_idx):
+        return self.evaluation_step(batch, compute_loss=False)
 
 
 def build_module(model_config, train_config):
@@ -88,10 +96,10 @@ def configs(config, lr, weight_decay, *, epochs=None):
         epochs=config["epochs"] if epochs is None else epochs, eval_interval=config["eval_interval"],
         seed=config["seed"], batch_size=config["batch_size"], grad_accum_steps=1,
         eval_batch_size=1, num_workers=config["num_workers"], pack_targets=False,
-        multi_scale=False, scale_jitter=False, square_resize_div_64=True, use_ema=False, compute_val_loss=False,
+        multi_scale=False, scale_jitter=False, square_resize_div_64=True, use_ema=False, compute_val_loss=True,
         lr=lr, lr_encoder=lr, weight_decay=weight_decay,
         lr_vit_layer_decay=1.0, lr_component_decay=1.0, lr_scheduler="cosine", warmup_epochs=0.5,
-        eval_max_dets=100, eval_masks_head_resolution=False, train_log_on_step=False, train_log_sync_dist=False,
+        eval_max_dets=100, eval_masks_head_resolution=False, train_log_on_step=True, train_log_sync_dist=False,
         accelerator="gpu", num_nodes=1, devices=1, run_test=False, wandb=False, tensorboard=False,
     )
     return model_config, train_config
@@ -164,6 +172,9 @@ class Evaluation(pl.Callback):
 
     def on_validation_epoch_end(self, trainer, module):
         scores = self.collect(trainer)
+        if self.checkpoint_dir is None:
+            previous_best = self.best[MASK_MAP] if self.best is not None else scores[MASK_MAP]
+            scores[OBJECTIVE] = max(previous_best, scores[MASK_MAP])
         module.log_dict(scores, on_step=False, on_epoch=True, batch_size=1)
         record = {"epoch": trainer.current_epoch + 1, "step": trainer.global_step, **scores}
         self.history.append(record)
@@ -242,6 +253,10 @@ def fit(config_path, *, entity, sweep_id=None, selection=None):
         if selection is not None:
             provenance["sweep_selection"] = selection
         evaluation = Evaluation("val", checkpoint_dir, provenance)
+        early_stopping = EarlyStopping(
+            monitor=MASK_MAP, mode="max", min_delta=0.001,
+            patience=10 if sweep_id else 15, check_on_train_epoch_end=False, verbose=True,
+        )
         run.config.update({
             "lr": lr, "lr_encoder": lr, "weight_decay": weight_decay,
             "variant": config["variant"], "resolution": model_config.resolution,
@@ -256,7 +271,7 @@ def fit(config_path, *, entity, sweep_id=None, selection=None):
             accelerator="gpu", num_nodes=1, devices=1, precision="bf16-mixed",
             max_epochs=train_config.epochs, accumulate_grad_batches=1,
             check_val_every_n_epoch=train_config.eval_interval, num_sanity_val_steps=0,
-            callbacks=[evaluation], logger=logger, log_every_n_steps=1,
+            callbacks=[evaluation, early_stopping], logger=logger, log_every_n_steps=1,
             enable_checkpointing=False, deterministic="warn", gradient_clip_val=0.1,
             default_root_dir=str(output),
         )
@@ -268,7 +283,7 @@ def fit(config_path, *, entity, sweep_id=None, selection=None):
         if checkpoint_dir is not None and not (checkpoint_dir / "best.pt").is_file():
             raise RuntimeError("Training finished without a validation checkpoint")
         metrics = {OBJECTIVE: best[MASK_MAP], SECONDARY: best[BOX_MAP]}
-        run.log(metrics)
+        run.log({SECONDARY: metrics[SECONDARY]} if sweep_id else metrics)
         run.summary.update(metrics)
         write_json(output / "result.json", {
             "run_path": f"{run.entity}/{run.project}/{run.id}", "run_id": run.id,

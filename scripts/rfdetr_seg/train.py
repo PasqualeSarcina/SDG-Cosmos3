@@ -1,8 +1,9 @@
 """Run a W&B sweep and train the final RF-DETR-Seg model on a DGX Spark."""
 
 from dataclasses import dataclass
-from multiprocessing import get_context
+import os
 from pathlib import Path
+import subprocess
 import sys
 
 import torch
@@ -22,6 +23,7 @@ class Args:
 
     config: Path
     sweep_count: int = 10
+    trial: bool = False  # Used by the W&B agent to launch a single trial.
 
     def __post_init__(self) -> None:
         if not self.config.is_file():
@@ -36,37 +38,27 @@ def main(argv: list[str] | None = None) -> None:
     config = load_config(config_path)
     if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
         raise RuntimeError("Training requires a CUDA GPU with BF16 support")
+    if args.trial:
+        fit(config_path, entity=os.environ["WANDB_ENTITY"], sweep_id=os.environ["WANDB_SWEEP_ID"])
+        return
 
     sweep_file = REPO_ROOT / "src" / "rfdetr_seg" / "sweep.yaml"
     sweep_config = yaml.safe_load(sweep_file.read_text(encoding="utf-8"))
     if not isinstance(sweep_config, dict) or sweep_config.get("metric") != {"name": OBJECTIVE, "goal": "maximize"}:
         raise ValueError(f"sweep.yaml must maximize {OBJECTIVE}")
+    sweep_config["program"] = str(Path(__file__).resolve())
+    sweep_config["command"] = [sys.executable, "${program}", "--config", str(config_path), "--trial"]
     project = config["wandb_project"]
     sweep_id = wandb.sweep(sweep_config, project=project)
     api = wandb.Api()
     entity = api.settings["entity"] or api.default_entity
-    processes = get_context("spawn")
-
-    def run_trial():
-        # The W&B callback runs in a thread. Keep each CUDA trainer in a fresh process.
-        worker = processes.Process(target=fit, args=(config_path,), kwargs={"entity": entity, "sweep_id": sweep_id})
-        worker.start()
-        try:
-            worker.join()
-            if worker.exitcode != 0:
-                raise RuntimeError(f"Sweep trial exited with status {worker.exitcode}")
-        finally:
-            if worker.is_alive():
-                worker.terminate()
-                worker.join(timeout=10)
-                if worker.is_alive():
-                    worker.kill()
-                    worker.join()
-            worker.close()
-
-    wandb.agent(sweep_id, function=run_trial, entity=entity, project=project, count=args.sweep_count)
-    wandb.teardown()
     sweep_path = f"{entity}/{project}/{sweep_id}"
+    # The CLI agent owns the trial process and can terminate it on a pruning command.
+    subprocess.run(
+        [sys.executable, "-m", "wandb", "agent", "--count", str(args.sweep_count), sweep_path],
+        check=True,
+    )
+    wandb.teardown()
     winner, score = best_sweep_run(wandb.Api().sweep(sweep_path).runs)
     selection = {
         "sweep": sweep_path, "run_id": winner.id, "best_mask_map": score,
