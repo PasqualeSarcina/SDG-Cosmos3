@@ -1,12 +1,14 @@
 {
   "dataset_dir": "/PATH/TO/COCO",
   "output_root": "/PATH/TO/OUTPUT/rfdetr-car",
-  "variant": "Medium",
-  "resolution": 720,
+  "variant": "Large",
   "seed": 2026,
   "batch_size": 32,
-  "sweep_epochs": 20,
+  "lr": 0.0001,
+  "lr_encoder": 0.00015,
+  "weight_decay": 0.0001,
   "epochs": 100,
+  "sweep_enabled": false,
   "eval_interval": 1,
   "num_workers": 4,
   "wandb_project": "rfdetr-car"

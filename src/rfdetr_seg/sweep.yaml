@@ -1,5 +1,5 @@
-name: rfdetr-seg-car-from-scratch
-method: random
+name: rfdetr-seg-car
+method: grid
 metric:
   name: sweep/best_mask_map
   goal: maximize
@@ -9,10 +9,6 @@ early_terminate:
   eta: 3
 parameters:
   lr:
-    distribution: log_uniform_values
-    min: 0.00005
-    max: 0.0005
-  weight_decay:
-    distribution: log_uniform_values
-    min: 0.00001
-    max: 0.001
+    values: [0.0001, 0.00007, 0.00015]
+  lr_encoder:
+    values: [0.00015, 0.0001, 0.000225]

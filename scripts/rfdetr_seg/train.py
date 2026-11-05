@@ -1,4 +1,4 @@
-"""Run a W&B sweep and train the final RF-DETR-Seg model on a DGX Spark."""
+"""Train RF-DETR-Seg and save the best validation checkpoint."""
 
 from dataclasses import dataclass
 import os
@@ -14,15 +14,15 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from src.rfdetr_seg.settings import OBJECTIVE, REPO_ROOT, load_config
-from src.rfdetr_seg.training import best_sweep_run, fit
+from src.rfdetr_seg.training import fit, save_best_sweep_checkpoint, training_topology
 
 
 @dataclass
 class Args:
-    """Run the sweep, select the best hyperparameters and save the final checkpoint."""
+    """Train once or launch a W&B sweep when enabled in the experiment config."""
 
     config: Path
-    sweep_count: int = 10
+    sweep_count: int = 9
     trial: bool = False  # Used by the W&B agent to launch a single trial.
 
     def __post_init__(self) -> None:
@@ -41,7 +41,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.trial:
         fit(config_path, entity=os.environ["WANDB_ENTITY"], sweep_id=os.environ["WANDB_SWEEP_ID"])
         return
+    if not config["sweep_enabled"]:
+        fit(config_path)
+        return
 
+    if training_topology()[0] > 1:
+        raise ValueError("Distributed RF-DETR training requires sweep_enabled=false")
     sweep_file = REPO_ROOT / "src" / "rfdetr_seg" / "sweep.yaml"
     sweep_config = yaml.safe_load(sweep_file.read_text(encoding="utf-8"))
     if not isinstance(sweep_config, dict) or sweep_config.get("metric") != {"name": OBJECTIVE, "goal": "maximize"}:
@@ -59,13 +64,8 @@ def main(argv: list[str] | None = None) -> None:
         check=True,
     )
     wandb.teardown()
-    winner, score = best_sweep_run(wandb.Api().sweep(sweep_path).runs)
-    selection = {
-        "sweep": sweep_path, "run_id": winner.id, "best_mask_map": score,
-        "lr": winner.config["lr"], "weight_decay": winner.config["weight_decay"],
-    }
-    print(f"Selected W&B run {winner.id} with mask mAP {score:.6f}", flush=True)
-    fit(config_path, entity=entity, selection=selection)
+    checkpoint, score = save_best_sweep_checkpoint(Path(config["output_root"]) / sweep_id)
+    print(f"Best sweep checkpoint (mask mAP {score:.6f}): {checkpoint}", flush=True)
 
 
 if __name__ == "__main__":

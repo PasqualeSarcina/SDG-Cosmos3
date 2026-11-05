@@ -25,27 +25,33 @@ def load_config(path):
     config = read_json(path)
     config.pop("grad_accum_steps", None)  # Accept experiment files copied from the old template.
     config.pop("dataset_lock", None)
+    config.setdefault("lr", 0.0001)
+    config.setdefault("lr_encoder", 0.00015)
+    config.setdefault("weight_decay", 0.0001)
+    config.setdefault("epochs", 100)
+    config.setdefault("sweep_epochs", config["epochs"])
+    config.setdefault("sweep_enabled", False)
+    if type(config["sweep_enabled"]) is not bool:
+        raise ValueError("sweep_enabled must be a boolean")
     if config["variant"] not in VARIANTS:
         raise ValueError(f"variant must be one of {VARIANTS}")
-    for key in ("resolution", "epochs", "eval_interval", "batch_size"):
+    for key in ("epochs", "sweep_epochs", "eval_interval", "batch_size"):
         if type(config[key]) is not int or config[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
     for key in ("seed", "num_workers"):
         if type(config[key]) is not int or config[key] < 0:
             raise ValueError(f"{key} must be a nonnegative integer")
-    if config["eval_interval"] > config["epochs"]:
-        raise ValueError("eval_interval cannot exceed epochs")
-    sweep_epochs = config.setdefault("sweep_epochs", min(config["epochs"], max(20, config["eval_interval"])))
-    if type(sweep_epochs) is not int or not config["eval_interval"] <= sweep_epochs <= config["epochs"]:
-        raise ValueError("sweep_epochs must be an integer between eval_interval and epochs")
+    if config["eval_interval"] > min(config["epochs"], config["sweep_epochs"]):
+        raise ValueError("eval_interval cannot exceed epochs or sweep_epochs")
     for key in ("dataset_dir", "output_root"):
         if not Path(config[key]).is_absolute():
             raise ValueError(f"{key} must be an absolute path")
     return config
 
 
-def validate_hyperparameters(lr, weight_decay):
-    if not isfinite(lr) or lr <= 0:
-        raise ValueError("lr must be positive and finite")
+def validate_hyperparameters(lr, lr_encoder, weight_decay):
+    for name, value in (("lr", lr), ("lr_encoder", lr_encoder)):
+        if not isfinite(value) or value <= 0:
+            raise ValueError(f"{name} must be positive and finite")
     if not isfinite(weight_decay) or weight_decay < 0:
         raise ValueError("weight_decay must be nonnegative and finite")
