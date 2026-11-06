@@ -96,7 +96,7 @@ def configs(config, lr, lr_encoder, weight_decay, *, epochs, num_nodes=1):
         multi_scale=False, scale_jitter=False, square_resize_div_64=True, use_ema=False, compute_val_loss=True,
         lr=lr, lr_encoder=lr_encoder, weight_decay=weight_decay,
         lr_vit_layer_decay=1.0, lr_component_decay=1.0, lr_scheduler="cosine", warmup_epochs=0.5,
-        eval_max_dets=100, eval_masks_head_resolution=False, train_log_on_step=True, train_log_sync_dist=False,
+        eval_max_dets=100, eval_masks_head_resolution=False, train_log_on_step=True, train_log_sync_dist=True,
         accelerator="gpu", num_nodes=num_nodes, devices=1,
         strategy="ddp" if num_nodes > 1 else "auto", run_test=False, wandb=False, tensorboard=False,
     )
@@ -289,7 +289,7 @@ def fit(config_path, *, entity=None, sweep_id=None):
         evaluation = Evaluation("val", output, provenance)
         early_stopping = EarlyStopping(
             monitor=MASK_MAP, mode="max", min_delta=0.001,
-            patience=10, check_on_train_epoch_end=False, verbose=True,
+            patience=15, check_on_train_epoch_end=False, verbose=True,
         )
         if run is not None:
             run.config.update({
