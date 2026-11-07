@@ -25,14 +25,12 @@ if not __package__:
     sys.path.insert(0, str(_PACKAGE_DIR))
 
 from src.caption.output_parameters import JSON_ENSURE_ASCII, apply_t2i_output_parameters, OutputParameters
+from src.lora.dataset import USER_PROMPT
+from src.lora.thinking_dataset import STUDENT_REASONING_EFFORT
 from src.request.response_parsing import parse_json_response
 from src.validation.scene_draft import cosmos_structural_tag, validate_scene_draft
 
 log = logging.getLogger(__name__)
-USER_PROMPT = (
-    "Generate a new, realistic, and visually diverse COCO-style scene containing "
-    "at least one car. Invent the scene from scratch."
-)
 
 
 @dataclass
@@ -47,22 +45,28 @@ class Args:
     """Base checkpoint directory or Hugging Face model ID."""
     lora_path: Annotated[str | None, tyro.conf.arg(aliases=["--lora_path"])] = None
     """Optional PEFT LoRA directory or Hugging Face repository, used for all requests."""
+    enable_thinking: bool = False
+    """Generate a native Qwen thinking plan at the effort used for supervised LoRA training."""
     resolution: str = "720"
     """Resolution tier from src.caption.output_parameters.RESOLUTION_RATIO_DICT."""
     aspect_ratio: Annotated[str, tyro.conf.arg(aliases=["--aspect_ratio"])] = "16,9"
     """Canonical aspect ratio: 16,9, 9,16, 1,1, 4,3 or 3,4."""
     batch_size: Annotated[int, tyro.conf.arg(aliases=["--batch_size"])] = 32
-    max_tokens: Annotated[int, tyro.conf.arg(aliases=["--max_tokens"])] = 3072
+    max_tokens: Annotated[int | None, tyro.conf.arg(aliases=["--max_tokens"])] = None
+    """Output budget: 3072 without thinking, 8192 with thinking (plan and caption combined)."""
     max_retries: Annotated[int, tyro.conf.arg(aliases=["--max_retries"])] = 3
     """Maximum attempts per caption, including the initial attempt."""
     gpu_memory_utilization: Annotated[float, tyro.conf.arg(aliases=["--gpu_memory_utilization"])] = 0.8
     spec_draft_n_max: int = 0
     """MTP tokens per step; disabled by default."""
-    temperature: float = 0.7
-    top_p: Annotated[float, tyro.conf.arg(aliases=["--top_p"])] = 0.8
+    temperature: float | None = None
+    """Qwen3.8-27B default: 0.7 without thinking, 1.0 with thinking."""
+    top_p: Annotated[float | None, tyro.conf.arg(aliases=["--top_p"])] = None
+    """Qwen3.8-27B default: 0.80 without thinking, 0.95 with thinking."""
     top_k: Annotated[int, tyro.conf.arg(aliases=["--top_k"])] = 20
     min_p: Annotated[float, tyro.conf.arg(aliases=["--min_p"])] = 0.0
-    presence_penalty: Annotated[float, tyro.conf.arg(aliases=["--presence_penalty"])] = 1.5
+    presence_penalty: Annotated[float | None, tyro.conf.arg(aliases=["--presence_penalty"])] = None
+    """Qwen3.8-27B default: 1.5 without thinking, 0.0 with thinking."""
     repetition_penalty: Annotated[float, tyro.conf.arg(aliases=["--repetition_penalty"])] = 1.0
     prompt_template_path: Annotated[Path | None, tyro.conf.arg(aliases=["--prompt_template_path"])] = (
         _PACKAGE_DIR / "src/templates/generate_caption.txt"
@@ -73,6 +77,14 @@ class Args:
     prompt_template: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
+        if self.max_tokens is None:
+            self.max_tokens = 8192 if self.enable_thinking else 3072
+        if self.temperature is None:
+            self.temperature = 1.0 if self.enable_thinking else 0.7
+        if self.top_p is None:
+            self.top_p = 0.95 if self.enable_thinking else 0.8
+        if self.presence_penalty is None:
+            self.presence_penalty = 0.0 if self.enable_thinking else 1.5
         for name in ("n", "batch_size", "max_tokens", "max_retries"):
             if getattr(self, name) < 1:
                 raise ValueError(f"--{name.replace('_', '-')} must be >= 1.")
@@ -187,7 +199,8 @@ class VLLMCaptionGenerator:
             raise RuntimeError("This script requires at least one CUDA GPU visible to PyTorch/vLLM.")
         self.args = args
         self.sampling_params_class = SamplingParams
-        self.structured_outputs = StructuredOutputsParams(
+        # The final-response grammar would prevent the native thinking plan.
+        self.structured_outputs = None if args.enable_thinking else StructuredOutputsParams(
             structural_tag=json.dumps(cosmos_structural_tag()),
         )
         self.lora_request = None
@@ -203,6 +216,12 @@ class VLLMCaptionGenerator:
             log.debug("Using LoRA %s with max_lora_rank=%d", path, rank)
         # Text-only tokenization avoids initializing an image/video processor.
         self.tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=False)
+        thinking_options = {}
+        if args.enable_thinking:
+            template = self.tokenizer.get_chat_template()
+            if "enable_thinking" not in template or "reasoning_effort" not in template:
+                raise ValueError("The checkpoint chat template must support enable_thinking and reasoning_effort.")
+            thinking_options = dict(reasoning_effort=STUDENT_REASONING_EFFORT, preserve_thinking=True)
         self.prompt = self.tokenizer.apply_chat_template(
             [
                 {"role": "system", "content": args.prompt_template},
@@ -210,8 +229,11 @@ class VLLMCaptionGenerator:
             ],
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=False,
+            enable_thinking=args.enable_thinking,
+            **thinking_options,
         )
+        if args.enable_thinking and not self.prompt.endswith("<think>\n"):
+            raise ValueError("The generation prefix must end with an open native thinking block.")
         # Keep the text engine optimizations from caption_from_image_nohttp,
         # while excluding the visual encoder and other multimodal modules.
         self.model = LLM(
@@ -257,7 +279,7 @@ class VLLMCaptionGenerator:
                 presence_penalty=self.args.presence_penalty,
                 repetition_penalty=self.args.repetition_penalty,
                 ignore_eos=False,
-                skip_special_tokens=True,
+                skip_special_tokens=not self.args.enable_thinking,
                 structured_outputs=self.structured_outputs,
                 seed=seed,
             ))
@@ -296,6 +318,17 @@ def _caption_json(args: Args, text: str) -> dict:
     return apply_t2i_output_parameters(scene, resolution=args.resolution, aspect_ratio=args.aspect_ratio)
 
 
+def _thinking_answer(continuation: str) -> str:
+    # The opening <think> is already in the prompt. vLLM may include the turn EOS in the text.
+    if continuation.count("</think>") != 1 or "<think>" in continuation:
+        raise ValueError("Expected one native thinking boundary before the final caption.")
+    plan, answer = continuation.split("</think>", 1)
+    answer = answer.strip().removesuffix("<|im_end|>").strip()
+    if not plan.strip() or not answer or "<|" in plan or "<|" in answer:
+        raise ValueError("Expected a nonempty native thinking plan and final caption without chat markers.")
+    return answer
+
+
 def _save_caption(args: Args, index: int, completion: CompletionOutput, attempt: int) -> None:
     path = _caption_path(args, index)
     if args.debug:
@@ -314,7 +347,8 @@ def _save_caption(args: Args, index: int, completion: CompletionOutput, attempt:
         )
     if completion.finish_reason != "stop":
         raise ValueError(f"Completion did not finish normally: {completion.finish_reason!r}.")
-    text = json.dumps(_caption_json(args, completion.text), indent=2, ensure_ascii=JSON_ENSURE_ASCII) + "\n"
+    answer = _thinking_answer(completion.text) if args.enable_thinking else completion.text
+    text = json.dumps(_caption_json(args, answer), indent=2, ensure_ascii=JSON_ENSURE_ASCII) + "\n"
     args.output.mkdir(parents=True, exist_ok=True)
     stream = path.open("x", encoding="utf-8", newline="\n")
     try:

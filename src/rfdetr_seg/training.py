@@ -289,7 +289,7 @@ def fit(config_path, *, entity=None, sweep_id=None):
         evaluation = Evaluation("val", output, provenance)
         early_stopping = EarlyStopping(
             monitor=MASK_MAP, mode="max", min_delta=0.001,
-            patience=15, check_on_train_epoch_end=False, verbose=True,
+            patience=10, check_on_train_epoch_end=False, verbose=True,
         )
         if run is not None:
             run.config.update({
