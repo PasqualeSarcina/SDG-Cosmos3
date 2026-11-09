@@ -3,7 +3,7 @@
 import argparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from http.client import HTTPException
 import json
 from pathlib import Path, PurePosixPath
@@ -38,8 +38,10 @@ def atomic_output(path):
     try:
         yield temporary
         temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
+    except BaseException:
+        with suppress(OSError):
+            temporary.unlink(missing_ok=True)
+        raise
 
 
 def check_space(path, extra_bytes=0):
@@ -155,8 +157,25 @@ def valid_jpeg(path, dimensions):
     try:
         with Image.open(path) as image:
             return image.format == "JPEG" and image.size == dimensions
-    except OSError:
+    except FileNotFoundError:
         return False
+    except OSError as exc:
+        if exc.errno is None:
+            return False
+        raise RuntimeError(f"Cannot read JPEG on output filesystem at {path}: {exc}") from exc
+
+
+def save_jpeg(path, jpeg, size, dimensions):
+    if len(jpeg) != size:
+        raise EOFError(f"Incomplete JPEG: {path.name}")
+    try:
+        check_space(path.parent, size)
+        with atomic_output(path) as temporary:
+            temporary.write_bytes(jpeg)
+            if not valid_jpeg(temporary, dimensions):
+                raise ValueError(f"Invalid JPEG or unexpected dimensions: {path.name}")
+    except OSError as exc:
+        raise RuntimeError(f"Cannot write JPEG on output filesystem at {path}: {exc}") from exc
 
 
 def download_patch(relative_url, selected, output, stop):
@@ -165,11 +184,11 @@ def download_patch(relative_url, selected, output, stop):
         print(f"{relative_url}: all {len(selected):,} JPEGs already present", flush=True)
         return set()
     print(f"{relative_url}: looking for {len(pending):,} JPEGs", flush=True)
+    check_space(output)
     for attempt in range(3):
         if stop.is_set():
             return set()
         try:
-            check_space(output)
             with urlopen(f"{BASE_URL}/{relative_url}", timeout=60) as response:
                 with tarfile.open(fileobj=response, mode="r|gz", bufsize=BLOCK_SIZE) as archive:
                     for member in archive:
@@ -178,12 +197,9 @@ def download_patch(relative_url, selected, output, stop):
                         name = PurePosixPath(member.name).name
                         if not member.isfile() or name not in pending:
                             continue
-                        check_space(output, member.size)
-                        with atomic_output(output / name) as temporary:
-                            with archive.extractfile(member) as source, temporary.open("wb") as target:
-                                shutil.copyfileobj(source, target, BLOCK_SIZE)
-                            if temporary.stat().st_size != member.size or not valid_jpeg(temporary, pending[name]):
-                                raise ValueError(f"Invalid JPEG or unexpected dimensions: {name}")
+                        with archive.extractfile(member) as source:
+                            jpeg = source.read()
+                        save_jpeg(output / name, jpeg, member.size, pending[name])
                         del pending[name]
                         if not pending:
                             break
