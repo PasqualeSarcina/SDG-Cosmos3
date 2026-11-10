@@ -27,6 +27,9 @@ def load_config(path):
     config.pop("dataset_lock", None)
     config.setdefault("lr", 0.0001)
     config.setdefault("lr_encoder", 0.00015)
+    config.setdefault("lr_schedule", "cosine")
+    if config["lr_schedule"] not in ("cosine", "constant"):
+        raise ValueError("lr_schedule must be 'cosine' or 'constant'")
     config.setdefault("weight_decay", 0.0001)
     config.setdefault("epochs", 100)
     config.setdefault("sweep_epochs", config["epochs"])

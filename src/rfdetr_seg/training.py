@@ -87,6 +87,7 @@ def build_module(model_config, train_config):
 def configs(config, lr, lr_encoder, weight_decay, *, epochs, num_nodes=1):
     cls = getattr(rfconfig, f"RFDETRSeg{config['variant']}Config")
     model_config = cls(pretrain_weights=None, num_classes=1, num_select=100, compile=True)
+    constant_lr = config["lr_schedule"] == "constant"
     train_config = rfconfig.SegmentationTrainConfig(
         dataset_dir=config["dataset_dir"], dataset_file="roboflow", output_dir=config["output_root"],
         augmentation_backend="albumentations", aug_config=augmentation(),
@@ -95,7 +96,10 @@ def configs(config, lr, lr_encoder, weight_decay, *, epochs, num_nodes=1):
         eval_batch_size=1, num_workers=config["num_workers"], pack_targets=False,
         multi_scale=False, scale_jitter=False, square_resize_div_64=True, use_ema=False, compute_val_loss=True,
         lr=lr, lr_encoder=lr_encoder, weight_decay=weight_decay,
-        lr_vit_layer_decay=1.0, lr_component_decay=1.0, lr_scheduler="cosine", warmup_epochs=0.5,
+        lr_vit_layer_decay=1.0, lr_component_decay=1.0,
+        lr_scheduler="torch.optim.lr_scheduler.ConstantLR" if constant_lr else "cosine",
+        lr_scheduler_kwargs={"factor": 1.0} if constant_lr else {},
+        warmup_epochs=0.0 if constant_lr else 0.5,
         eval_max_dets=100, eval_masks_head_resolution=False, train_log_on_step=True, train_log_sync_dist=True,
         accelerator="gpu", num_nodes=num_nodes, devices=1,
         strategy="ddp" if num_nodes > 1 else "auto", run_test=False, wandb=False, tensorboard=False,
@@ -294,6 +298,7 @@ def fit(config_path, *, entity=None, sweep_id=None):
         if run is not None:
             run.config.update({
                 "lr": lr, "lr_encoder": lr_encoder, "weight_decay": weight_decay,
+                "lr_schedule": config["lr_schedule"], "warmup_epochs": train_config.warmup_epochs,
                 "variant": config["variant"], "resolution": model_config.resolution,
                 "seed": config["seed"], "batch_size_per_gpu": train_config.batch_size,
                 "effective_batch_size": train_config.batch_size * num_nodes, "num_nodes": num_nodes,
