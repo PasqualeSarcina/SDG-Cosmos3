@@ -240,16 +240,17 @@ def process_split(args, split, predict, mask_utils, np, stamps, notify):
 
     for group in groups.values():
         for batch in batched(group, args.batch_size):
-            pending = []
+            pending_by_prompt_count = defaultdict(list)
             reused = skipped = 0
             for record in batch:
                 image_id = record["id"]
                 rows = split.annotations.get(image_id, ())
                 prompts = []
+                discarded = {}
                 for row in rows:
                     box = prompt_box(row.get("bbox"), record["width"], record["height"])
                     if box is None:
-                        report(f"annotation ID {row['id']} (image ID {image_id}): unusable box {row.get('bbox')!r}")
+                        discarded[str(row["id"])] = {"discard_reason": f"unusable box {row.get('bbox')!r}"}
                     else:
                         prompts.append((row["id"], box))
 
@@ -262,26 +263,25 @@ def process_split(args, split, predict, mask_utils, np, stamps, notify):
                     report(f"image ID {image_id}: {source}: {exc}")
                     skipped += 1
                     continue
-                if len(prompts) != len(rows):
-                    skipped += 1
-                elif cached:
+                if cached:
                     reused += 1
                 elif prompts:
-                    pending.append((record, source, stamp, prompts, image))
+                    # After discards, SAM3 still needs the same prompt count per image in a batch.
+                    pending_by_prompt_count[len(prompts)].append((record, source, stamp, prompts, image, discarded))
                 else:
-                    save(record, source, stamp, {})
+                    save(record, source, stamp, discarded)
 
             if reused or skipped:
                 notify(("checked", (reused, skipped)))
-            if pending:
+            for pending in pending_by_prompt_count.values():
                 images = [job[4] for job in pending]
                 boxes = [[box for _, box in job[3]] for job in pending]
-                for (record, source, stamp, prompts, image), (masks, finite) in zip(
+                for (record, source, stamp, prompts, image, discarded), (masks, finite) in zip(
                     pending, predict(images, boxes), strict=True,
                 ):
                     results = encode_results(record, prompts, masks, finite, mask_utils, np)
                     retry_failed_masks(image, record, prompts, results, predict, args.batch_size, mask_utils, np)
-                    save(record, source, stamp, results)
+                    save(record, source, stamp, {**discarded, **results})
     return failures
 
 
@@ -442,7 +442,7 @@ def write_split(db, args, split, target, mask_utils, stale_jpegs, progress):
         json.dump(kept, stream, **JSON_OPTIONS)
         stream.write("}\n")
     return (f"{split.name}: {len(kept)} JPEGs and {count} masks exported; "
-            f"{len(records) - len(kept)} images excluded, {discarded} masks failed, "
+            f"{len(records) - len(kept)} images excluded, {discarded} annotations discarded, "
             f"{recovered} masks recovered on crops")
 
 
@@ -530,7 +530,7 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog="Requires the sam dependency group and access to facebook/sam3 on Hugging Face. "
-        "Failed masks are retried on a crop. Remaining failures discard the annotation; "
+        "Unusable boxes are discarded. Failed masks are retried on a crop; remaining failures discard the annotation. "
         "train images that lose all annotations and valid images with missing masks are excluded. "
         "Re-run with the same input and output to resume. Use a fresh output if the source JSON changes.",
     )
