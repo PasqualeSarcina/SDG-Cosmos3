@@ -208,7 +208,8 @@ def train(args: Args) -> None:
         num_select=200,
         pretrain_weights=None,
         layer_norm=True,
-        gradient_checkpointing=True,
+        gradient_checkpointing=False,
+        compile=True,
     )
     train_config = SegmentationTrainConfig(
         dataset_file="roboflow",
