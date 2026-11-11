@@ -172,8 +172,8 @@ def paper_scales(resolution, expanded_scales, patch_size, num_windows):
     return list(TRAIN_RESOLUTIONS)
 
 
-def align_ema_state_dict(module, state_dict):
-    """Match EMA checkpoint keys to the target's torch.compile wrappers."""
+def align_compiled_state_dict(module, state_dict):
+    """Match live or EMA checkpoint keys to the target's torch.compile wrappers."""
     def uncompiled_key(key):
         return ".".join(part for part in key.split(".") if part != "_orig_mod")
 
@@ -183,7 +183,7 @@ def align_ema_state_dict(module, state_dict):
     for key, value in state_dict.items():
         target_key = key if key in target_state else target_keys.get(uncompiled_key(key), key)
         if target_key in aligned:
-            raise RuntimeError(f"Multiple EMA checkpoint keys map to {target_key!r}.")
+            raise RuntimeError(f"Multiple checkpoint keys map to {target_key!r}.")
         aligned[target_key] = value
     if aligned.keys() == state_dict.keys():
         return state_dict
@@ -210,6 +210,10 @@ def train(args: Args) -> None:
     wandb_logger = make_wandb_logger(args)
 
     class Objects365ModelModule(RFDETRModelModule):
+        def on_load_checkpoint(self, checkpoint):
+            super().on_load_checkpoint(checkpoint)
+            checkpoint["state_dict"] = align_compiled_state_dict(self, checkpoint["state_dict"])
+
         def on_save_checkpoint(self, checkpoint):
             super().on_save_checkpoint(checkpoint)
             if wandb_logger is not None and self.trainer.is_global_zero:
@@ -251,6 +255,7 @@ def train(args: Args) -> None:
         eval_max_dets=100,
         eval_backend="faster_coco_eval",
         compute_val_loss=True,
+        eval_interval=1,
         num_workers=args.num_workers,
         accelerator="gpu",
         devices=args.devices,
@@ -271,7 +276,8 @@ def train(args: Args) -> None:
         square_resize_div_64=True,
         multi_scale="per-batch",
         expanded_scales=True,
-        early_stopping=False,
+        early_stopping=True,
+        early_stopping_patience=10,
         run_test=False,
         progress_bar="tqdm",
         train_log_on_step=True,
@@ -286,6 +292,9 @@ def train(args: Args) -> None:
     build_model = partial(build_model_from_config, defaults=defaults)
     with patch.object(module_model, "build_model_from_config", build_model):
         model = Objects365ModelModule(model_config, train_config)
+    # RF-DETR defaults to permissive loading, which can silently skip all live
+    # model weights when resuming across a change to torch.compile.
+    model.strict_loading = True
     model.postprocess = CarPostProcess(num_select=train_config.eval_max_dets)
 
     if args.resume is None:
@@ -304,7 +313,7 @@ def train(args: Args) -> None:
     ema_load_weights = RFDETREMACallback._load_ema_weights
 
     def load_ema_weights(callback, module, state_dict):
-        return ema_load_weights(callback, module, align_ema_state_dict(module, state_dict))
+        return ema_load_weights(callback, module, align_compiled_state_dict(module, state_dict))
 
     # Supply the same scale grid to the native dataset transforms and batch
     # resize hook. RF-DETR samples by optimizer step, shared across DDP ranks.
