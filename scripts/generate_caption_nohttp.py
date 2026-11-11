@@ -33,9 +33,17 @@ from src.validation.scene_draft import cosmos_structural_tag, validate_scene_dra
 log = logging.getLogger(__name__)
 
 
+def _uses_torchrun() -> bool:
+    return "LOCAL_RANK" in os.environ or int(os.environ.get("WORLD_SIZE", "1")) > 1
+
+
+def _is_primary_rank() -> bool:
+    return not _uses_torchrun() or int(os.environ["RANK"]) == 0
+
+
 @dataclass
 class Args:
-    """Generate N independent JSON captions using vLLM on all visible CUDA GPUs."""
+    """Generate N independent JSON captions using local CUDA GPUs or torchrun (one process per GPU)."""
 
     n: Annotated[int, tyro.conf.arg(aliases=["-n"])]
     """Number of captions to generate, not the number of batches."""
@@ -54,6 +62,8 @@ class Args:
     batch_size: Annotated[int, tyro.conf.arg(aliases=["--batch_size"])] = 32
     max_tokens: Annotated[int | None, tyro.conf.arg(aliases=["--max_tokens"])] = None
     """Output budget: 3072 without thinking, 8192 with thinking (plan and caption combined)."""
+    max_model_len: int | None = None
+    """Optional vLLM context limit in tokens, including both prompt and output."""
     max_retries: Annotated[int, tyro.conf.arg(aliases=["--max_retries"])] = 3
     """Maximum attempts per caption, including the initial attempt."""
     gpu_memory_utilization: Annotated[float, tyro.conf.arg(aliases=["--gpu_memory_utilization"])] = 0.8
@@ -88,6 +98,8 @@ class Args:
         for name in ("n", "batch_size", "max_tokens", "max_retries"):
             if getattr(self, name) < 1:
                 raise ValueError(f"--{name.replace('_', '-')} must be >= 1.")
+        if self.max_model_len is not None and self.max_model_len < 1:
+            raise ValueError("--max-model-len must be >= 1.")
         if self.spec_draft_n_max < 0:
             raise ValueError("--spec-draft-n-max must be >= 0.")
         if not 0 < self.gpu_memory_utilization <= 1:
@@ -110,7 +122,8 @@ class Args:
             raise ValueError("--lora-path cannot be empty.")
         OutputParameters(self.resolution, self.aspect_ratio)
         self.output = Path(self.output)
-        _check_output_paths(self)
+        if _is_primary_rank():
+            _check_output_paths(self)
         template_path = Path(self.prompt_template_path or _PACKAGE_DIR / "src/templates/generate_caption.txt")
         self.prompt_template = template_path.read_text(encoding="utf-8-sig")
         if not self.prompt_template.strip():
@@ -176,6 +189,7 @@ def _lora_rank(path: Path, supported_ranks: tuple[int, ...]) -> int:
 
 class VLLMCaptionGenerator:
     def __init__(self, args: Args):
+        torchrun = _uses_torchrun()
         # Set before importing vLLM/Transformers, also for spawned worker processes.
         os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
         os.environ["VLLM_NO_USAGE_STATS"] = "1"
@@ -186,8 +200,7 @@ class VLLMCaptionGenerator:
             from vllm.sampling_params import StructuredOutputsParams
         except ImportError as exc:
             raise RuntimeError(
-                "This script requires vLLM. Install the caption-vllm dependency group "
-                "on Linux/WSL with compatible CUDA GPUs."
+                "This script requires vLLM on Linux/WSL with compatible CUDA GPUs."
             ) from exc
         import torch
         from transformers import AutoTokenizer
@@ -197,6 +210,16 @@ class VLLMCaptionGenerator:
         gpu_count = torch.cuda.device_count()
         if not torch.cuda.is_available() or gpu_count < 1:
             raise RuntimeError("This script requires at least one CUDA GPU visible to PyTorch/vLLM.")
+        parallel_options = dict(tensor_parallel_size=gpu_count, distributed_executor_backend="mp")
+        if torchrun:
+            if (int(os.environ.get("LOCAL_WORLD_SIZE", "1")) > gpu_count
+                    or not 0 <= int(os.environ["LOCAL_RANK"]) < gpu_count):
+                raise ValueError("Launch at most one torchrun process per visible GPU with --nproc-per-node.")
+            parallel_options = dict(
+                tensor_parallel_size=int(os.environ["WORLD_SIZE"]),
+                distributed_executor_backend="external_launcher",
+                seed=0,
+            )
         self.args = args
         self.sampling_params_class = SamplingParams
         # The final-response grammar would prevent the native thinking plan.
@@ -238,8 +261,7 @@ class VLLMCaptionGenerator:
         # while excluding the visual encoder and other multimodal modules.
         self.model = LLM(
             model=args.model,
-            tensor_parallel_size=gpu_count,
-            distributed_executor_backend="mp",
+            max_model_len=args.max_model_len,
             structured_outputs_config={"backend": "xgrammar"},
             max_num_seqs=args.batch_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
@@ -256,22 +278,31 @@ class VLLMCaptionGenerator:
                 {"method": "mtp", "num_speculative_tokens": args.spec_draft_n_max}
                 if args.spec_draft_n_max else None
             ),
+            **parallel_options,
             **lora_options,
         )
+        self.world = None
+        if torchrun:
+            from vllm.distributed.parallel_state import get_world_group
+
+            self.world = get_world_group()
+            self.prompt = self.broadcast(self.prompt)
         log.debug("Using vLLM tensor_parallel_size=%d, MTP tokens=%d, GPU memory budget=%.0f%%",
-                  gpu_count, args.spec_draft_n_max, args.gpu_memory_utilization * 100)
+                  parallel_options["tensor_parallel_size"], args.spec_draft_n_max, args.gpu_memory_utilization * 100)
+
+    def broadcast[T](self, value: T) -> T:
+        return self.world.broadcast_object(value) if self.world is not None else value
 
     def generate(self, count: int) -> list[CompletionOutput | Exception]:
         if count < 1:
             return []
-        # Give each request its own RNG stream, including repeated prompts.
-        seeds: set[int] = set()
+        # Each request gets its own seed, shared by all tensor-parallel ranks.
+        seeds: dict[int, None] = {}
+        if self.world is None or self.world.rank_in_group == 0:
+            while len(seeds) < count:
+                seeds[secrets.randbits(63)] = None
         sampling_params = []
-        for _ in range(count):
-            seed = secrets.randbits(63)
-            while seed in seeds:
-                seed = secrets.randbits(63)
-            seeds.add(seed)
+        for seed in self.broadcast(list(seeds)):
             sampling_params.append(self.sampling_params_class.from_optional(
                 n=1, max_tokens=self.args.max_tokens,
                 temperature=self.args.temperature, top_p=self.args.top_p,
@@ -362,12 +393,15 @@ def _save_caption(args: Args, index: int, completion: CompletionOutput, attempt:
 
 def generate_captions(args: Args) -> list[str]:
     """Load one model, save valid captions and return the names that exhausted retries."""
-    _check_output_paths(args)
+    torchrun = _uses_torchrun()
+    primary = _is_primary_rank()
+    if primary:
+        _check_output_paths(args)
     failed: list[str] = []
     succeeded = 0
     with logging_redirect_tqdm(), tqdm(
         total=args.n, desc="Loading model", unit="caption", dynamic_ncols=True,
-        mininterval=0.5, postfix={"ok": 0, "failed": 0},
+        mininterval=0.5, postfix={"ok": 0, "failed": 0}, disable=not primary,
     ) as progress:
         backend = VLLMCaptionGenerator(args)
         progress.set_description("Generating captions")
@@ -381,28 +415,35 @@ def generate_captions(args: Args) -> list[str]:
                     if len(results) != len(pending):
                         raise ValueError("The backend returned a different number of captions than requested.")
                 except Exception as exc:
+                    if torchrun:
+                        # A failed engine call can leave another rank inside a collective.
+                        # Let torchrun terminate the job instead of retrying that call locally.
+                        raise
                     results = [exc] * len(pending)
                 retry = []
-                for index, result in zip(pending, results):
-                    path = _caption_path(args, index)
-                    try:
-                        if isinstance(result, Exception):
-                            raise result
-                        _save_caption(args, index, result, attempt)
-                    except Exception as exc:
-                        log.debug("%s: attempt %d/%d failed: %s", path.name, attempt, args.max_retries,
-                                  exc, exc_info=args.debug)
-                        if attempt < args.max_retries:
-                            retry.append(index)
-                            continue
-                        log.error("Cannot generate %s after %d attempts: %s", path.name, attempt, exc)
-                        failed.append(path.name)
-                    else:
-                        succeeded += 1
-                    progress.set_postfix(ok=succeeded, failed=len(failed), refresh=False)
-                    progress.update(1)
-                pending = retry
-    if failed:
+                if primary:
+                    for index, result in zip(pending, results):
+                        path = _caption_path(args, index)
+                        try:
+                            if isinstance(result, Exception):
+                                raise result
+                            _save_caption(args, index, result, attempt)
+                        except Exception as exc:
+                            log.debug("%s: attempt %d/%d failed: %s", path.name, attempt, args.max_retries,
+                                      exc, exc_info=args.debug)
+                            if attempt < args.max_retries:
+                                retry.append(index)
+                                continue
+                            log.error("Cannot generate %s after %d attempts: %s", path.name, attempt, exc)
+                            failed.append(path.name)
+                        else:
+                            succeeded += 1
+                        progress.set_postfix(ok=succeeded, failed=len(failed), refresh=False)
+                        progress.update(1)
+                pending = backend.broadcast(retry) if torchrun else retry
+        if torchrun:
+            failed = backend.broadcast(failed)
+    if failed and primary:
         log.error("Failed captions: %s", ", ".join(failed))
     return failed
 
