@@ -17,6 +17,7 @@ Use --wandb-project to log metrics to W&B. The run identity is saved in the
 Lightning checkpoint, so --resume reconnects to it automatically.
 """
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from functools import partial
 from importlib.metadata import PackageNotFoundError, version
@@ -171,6 +172,31 @@ def paper_scales(resolution, expanded_scales, patch_size, num_windows):
     return list(TRAIN_RESOLUTIONS)
 
 
+def align_ema_state_dict(module, state_dict):
+    """Match EMA checkpoint keys to the target's torch.compile wrappers."""
+    def uncompiled_key(key):
+        return ".".join(part for part in key.split(".") if part != "_orig_mod")
+
+    target_state = module.state_dict()
+    target_keys = {uncompiled_key(key): key for key in target_state}
+    aligned = OrderedDict()
+    for key, value in state_dict.items():
+        target_key = key if key in target_state else target_keys.get(uncompiled_key(key), key)
+        if target_key in aligned:
+            raise RuntimeError(f"Multiple EMA checkpoint keys map to {target_key!r}.")
+        aligned[target_key] = value
+    if aligned.keys() == state_dict.keys():
+        return state_dict
+
+    metadata = getattr(state_dict, "_metadata", None)
+    if metadata is not None:
+        module_keys = {uncompiled_key(name): name for name, _ in module.named_modules()}
+        aligned._metadata = OrderedDict(
+            (module_keys.get(uncompiled_key(key), key), value) for key, value in metadata.items()
+        )
+    return aligned
+
+
 def train(args: Args) -> None:
     from pytorch_lightning.utilities.rank_zero import rank_zero_only
     from rfdetr.config import RFDETRSegLargeConfig, SegmentationTrainConfig
@@ -179,6 +205,7 @@ def train(args: Args) -> None:
     from rfdetr.models.lwdetr import build_model_from_config
     from rfdetr.models.postprocess import PostProcess
     from rfdetr.training import RFDETRDataModule, RFDETRModelModule, build_trainer, module_model, seed_everything
+    from rfdetr.training.callbacks.ema import RFDETREMACallback
 
     wandb_logger = make_wandb_logger(args)
 
@@ -273,11 +300,18 @@ def train(args: Args) -> None:
         f"RF-DETR-Seg Large | Car | 200 queries | batch {args.batch_size}/GPU, {global_batch_size} global "
         f"| train scales {TRAIN_RESOLUTIONS}"
     )
+    # RF-DETR 1.11.2 does not align compiled/uncompiled keys when restoring EMA.
+    ema_load_weights = RFDETREMACallback._load_ema_weights
+
+    def load_ema_weights(callback, module, state_dict):
+        return ema_load_weights(callback, module, align_ema_state_dict(module, state_dict))
+
     # Supply the same scale grid to the native dataset transforms and batch
     # resize hook. RF-DETR samples by optimizer step, shared across DDP ranks.
     with (
         patch.object(coco, "compute_multi_scale_scales", paper_scales),
         patch.object(module_model, "compute_multi_scale_scales", paper_scales),
+        patch.object(RFDETREMACallback, "_load_ema_weights", load_ema_weights),
     ):
         trainer.fit(model, datamodule=data, ckpt_path=args.resume)
 
