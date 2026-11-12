@@ -1,9 +1,13 @@
-"""Pre-train RF-DETR-Seg Large on Objects365 Car boxes and instance masks.
+"""Train or fine-tune RF-DETR-Seg Large on Car boxes and instance masks.
 
 Use the project's rfdetrn dependency group. Pass the output of
 scripts/add_objects365_car_masks.py as --dataset-dir. It adds SAM3 masks to the
 dataset from scripts/download_objects365_car.py, in the same train/valid
 COCO layout.
+
+For fine-tuning on COCO Car, use the same train/valid layout and pass
+--pretrain-weights with an Objects365 RF-DETR checkpoint. Only model weights
+are loaded; optimizer, EMA counters, early stopping and W&B start a new run.
 
 This is a fixed-architecture adaptation of RF-DETR v2, Table 6 and Appendix A.
 It keeps the public Seg Large preset's 200 queries and trains only Car. The
@@ -18,6 +22,7 @@ Lightning checkpoint, so --resume reconnects to it automatically.
 """
 
 from collections import OrderedDict
+from contextlib import ExitStack
 from dataclasses import dataclass
 from functools import partial
 from importlib.metadata import PackageNotFoundError, version
@@ -39,12 +44,18 @@ WANDB_RUN_KEY = "objects365_wandb_run"
 
 @dataclass
 class Args:
-    # Output of scripts/add_objects365_car_masks.py.
+    # Car dataset in Roboflow COCO train/valid layout.
     dataset_dir: Path
     # Directory for logs and checkpoints.
     output_dir: Path
+    # Maximum number of training epochs.
+    epochs: int = 60
     # Training images per GPU per optimizer update.
     batch_size: int = 4
+    # Base learning rate.
+    lr: float = 1e-4
+    # Encoder learning rate before component and layer decay.
+    lr_encoder: float = 1.5e-4
     # GPUs per node.
     devices: int = 1
     # Number of nodes.
@@ -59,19 +70,26 @@ class Args:
     wandb_entity: str | None = None
     # Local Meta DINOv2-S/14 safetensors file.
     dinov2_weights: Path | None = None
+    # RF-DETR .pth or Lightning .ckpt weights for a new fine-tuning run.
+    pretrain_weights: Path | None = None
     # Lightning checkpoint to resume from.
     resume: Path | None = None
 
     def __post_init__(self) -> None:
+        if self.epochs < 1:
+            raise ValueError("Epochs must be positive.")
         if min(self.batch_size, self.devices, self.num_nodes) < 1 or self.num_workers < 0:
             raise ValueError("Batch size, devices and nodes must be positive. Workers must be nonnegative.")
-        if self.dinov2_weights is not None and self.resume is not None:
-            raise ValueError("--dinov2-weights and --resume are mutually exclusive.")
+        if not all(math.isfinite(lr) and lr > 0 for lr in (self.lr, self.lr_encoder)):
+            raise ValueError("Learning rates must be positive and finite.")
+        checkpoints = (self.dinov2_weights, self.pretrain_weights, self.resume)
+        if sum(path is not None for path in checkpoints) > 1:
+            raise ValueError("--dinov2-weights, --pretrain-weights and --resume are mutually exclusive.")
         for split in ("train", "valid"):
             annotations = self.dataset_dir / split / "_annotations.coco.json"
             if not annotations.is_file():
                 raise ValueError(f"Missing {annotations}")
-        for checkpoint in (self.dinov2_weights, self.resume):
+        for checkpoint in checkpoints:
             if checkpoint is not None and not checkpoint.is_file():
                 raise ValueError(f"Missing {checkpoint}")
         if self.resume is not None and self.resume.suffix != ".ckpt":
@@ -197,10 +215,46 @@ def align_compiled_state_dict(module, state_dict):
     return aligned
 
 
+def load_pretrain_weights(model, weights_path):
+    """Load only network weights, keeping the new run's training state fresh."""
+    import torch
+
+    checkpoint = torch.load(weights_path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict):
+        raise ValueError("Expected an RF-DETR checkpoint with 'model' or 'state_dict' weights.")
+    if "model" in checkpoint:
+        state = checkpoint["model"]
+    elif isinstance(checkpoint.get("state_dict"), dict):
+        # Lightning checkpoints include the module's 'model.' prefix and may
+        # also contain criterion buffers, which are not network weights.
+        lightning_state = checkpoint["state_dict"]
+        prefix = "model."
+        state = OrderedDict(
+            (key.removeprefix(prefix), value)
+            for key, value in lightning_state.items()
+            if key.startswith(prefix)
+        )
+        metadata = getattr(lightning_state, "_metadata", None)
+        if metadata is not None:
+            state._metadata = OrderedDict(
+                ("" if key == "model" else key.removeprefix(prefix), value)
+                for key, value in metadata.items()
+                if key == "model" or key.startswith(prefix)
+            )
+    else:
+        raise ValueError("Expected an RF-DETR checkpoint with 'model' or 'state_dict' weights.")
+    if not isinstance(state, dict) or not state:
+        raise ValueError("The checkpoint contains no model weights.")
+    model.load_state_dict(align_compiled_state_dict(model, state), strict=True)
+    print(f"Initialized model weights from {weights_path}; starting a new training run.")
+
+
 def train(args: Args) -> None:
     from pytorch_lightning.utilities.rank_zero import rank_zero_only
+    from torch._dynamo import config as dynamo_config
     from rfdetr.config import RFDETRSegLargeConfig, SegmentationTrainConfig
     from rfdetr.datasets import coco
+    from rfdetr.models import lwdetr
     from rfdetr.models._defaults import ModelDefaults
     from rfdetr.models.lwdetr import build_model_from_config
     from rfdetr.models.postprocess import PostProcess
@@ -248,7 +302,7 @@ def train(args: Args) -> None:
         output_dir=str(args.output_dir),
         # RF-DETR restores the existing CSV history while constructing the trainer.
         resume=args.resume if rank_zero_only.rank == 0 else None,
-        epochs=60,
+        epochs=args.epochs,
         batch_size=args.batch_size,
         grad_accum_steps=1,
         eval_batch_size=1,
@@ -262,8 +316,8 @@ def train(args: Args) -> None:
         num_nodes=args.num_nodes,
         strategy="ddp" if args.devices * args.num_nodes > 1 else "auto",
         seed=args.seed,
-        lr=1e-4,
-        lr_encoder=1.5e-4,
+        lr=args.lr,
+        lr_encoder=args.lr_encoder,
         lr_vit_layer_decay=0.8,
         lr_component_decay=0.7,
         lr_scheduler="torch.optim.lr_scheduler.ConstantLR",
@@ -290,14 +344,26 @@ def train(args: Args) -> None:
     # released Large preset's feature taps, which are indexed separately.
     defaults = ModelDefaults(window_block_indexes=list(WINDOW_BLOCKS))
     build_model = partial(build_model_from_config, defaults=defaults)
-    with patch.object(module_model, "build_model_from_config", build_model):
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(module_model, "build_model_from_config", build_model))
+        if args.pretrain_weights is not None:
+            # RF-DETR 1.11.2 otherwise downloads DINOv2 during construction,
+            # even though the full network will be loaded from our checkpoint.
+            backbone_builder = lwdetr.build_backbone
+
+            def without_encoder_weights(**kwargs):
+                return backbone_builder(**{**kwargs, "load_dinov2_weights": False})
+
+            stack.enter_context(patch.object(lwdetr, "build_backbone", without_encoder_weights))
         model = Objects365ModelModule(model_config, train_config)
     # RF-DETR defaults to permissive loading, which can silently skip all live
     # model weights when resuming across a change to torch.compile.
     model.strict_loading = True
     model.postprocess = CarPostProcess(num_select=train_config.eval_max_dets)
 
-    if args.resume is None:
+    if args.pretrain_weights is not None:
+        load_pretrain_weights(model.model, args.pretrain_weights)
+    elif args.resume is None:
         load_dinov2(model.model.backbone[0].encoder.encoder, args.dinov2_weights)
 
     data = Objects365DataModule(model_config, train_config)
@@ -305,9 +371,12 @@ def train(args: Args) -> None:
     if wandb_logger is not None:
         trainer.loggers = [*trainer.loggers, wandb_logger]
     global_batch_size = args.batch_size * args.devices * args.num_nodes
+    # Allow shape-specialized variants for the eleven training scales and
+    # validation instead of falling back to eager after the default eight.
+    compile_recompile_limit = max(dynamo_config.recompile_limit, 32)
     print(
         f"RF-DETR-Seg Large | Car | 200 queries | batch {args.batch_size}/GPU, {global_batch_size} global "
-        f"| train scales {TRAIN_RESOLUTIONS}"
+        f"| train scales {TRAIN_RESOLUTIONS} | compile recompile limit {compile_recompile_limit}"
     )
     # RF-DETR 1.11.2 does not align compiled/uncompiled keys when restoring EMA.
     ema_load_weights = RFDETREMACallback._load_ema_weights
@@ -321,6 +390,7 @@ def train(args: Args) -> None:
         patch.object(coco, "compute_multi_scale_scales", paper_scales),
         patch.object(module_model, "compute_multi_scale_scales", paper_scales),
         patch.object(RFDETREMACallback, "_load_ema_weights", load_ema_weights),
+        dynamo_config.patch(recompile_limit=compile_recompile_limit),
     ):
         trainer.fit(model, datamodule=data, ckpt_path=args.resume)
 
