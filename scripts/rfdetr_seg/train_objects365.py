@@ -14,8 +14,8 @@ It keeps the public Seg Large preset's 200 queries and trains only Car. The
 optimizer and EMA use the public RF-DETR implementation for details absent
 from the paper.
 
---batch-size sets the training batch on each GPU. Each batch produces one
-optimizer update across all GPUs.
+--batch-size sets the microbatch on each GPU. The effective batch per optimizer
+update is batch_size * devices * num_nodes * grad_accum_steps.
 
 Use --wandb-project to log metrics to W&B. The run identity is saved in the
 Lightning checkpoint, so --resume reconnects to it automatically.
@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from functools import partial
 from importlib.metadata import PackageNotFoundError, version
 import math
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -50,8 +51,16 @@ class Args:
     output_dir: Path
     # Maximum number of training epochs.
     epochs: int = 60
-    # Training images per GPU per optimizer update.
+    # Training images per GPU per microbatch.
     batch_size: int = 4
+    # Microbatches accumulated before each optimizer update.
+    grad_accum_steps: int = 1
+    # Minimum absolute validation mAP improvement; zero accepts any strict increase.
+    early_stopping_min_delta: float = 0.0
+    # Consecutive validations without a new accepted best before stopping.
+    early_stopping_patience: int = 10
+    # Reset exhausted patience on this resume, keeping the actual historical best.
+    reset_early_stopping: bool = False
     # Base learning rate.
     lr: float = 1e-4
     # Encoder learning rate before component and layer decay.
@@ -78,8 +87,13 @@ class Args:
     def __post_init__(self) -> None:
         if self.epochs < 1:
             raise ValueError("Epochs must be positive.")
-        if min(self.batch_size, self.devices, self.num_nodes) < 1 or self.num_workers < 0:
-            raise ValueError("Batch size, devices and nodes must be positive. Workers must be nonnegative.")
+        if min(self.batch_size, self.devices, self.num_nodes, self.grad_accum_steps,
+               self.early_stopping_patience) < 1 or self.num_workers < 0:
+            raise ValueError("Batch size, devices, nodes, accumulation and patience must be positive. Workers must be nonnegative.")
+        if not math.isfinite(self.early_stopping_min_delta) or self.early_stopping_min_delta < 0:
+            raise ValueError("Early stopping min_delta must be finite and nonnegative.")
+        if self.reset_early_stopping and self.resume is None:
+            raise ValueError("--reset-early-stopping requires --resume.")
         if not all(math.isfinite(lr) and lr > 0 for lr in (self.lr, self.lr_encoder)):
             raise ValueError("Learning rates must be positive and finite.")
         checkpoints = (self.dinov2_weights, self.pretrain_weights, self.resume)
@@ -107,6 +121,8 @@ def make_wandb_logger(args: Args):
 
         # Map tensors without reading their contents. Lightning restores them during fit.
         checkpoint = torch.load(args.resume, map_location="cpu", weights_only=True, mmap=True)
+        if not checkpoint.get("optimizer_states") or not checkpoint.get("lr_schedulers"):
+            raise ValueError("--resume requires a full training checkpoint with optimizer and scheduler state, such as last.ckpt.")
         identity = checkpoint.get(WANDB_RUN_KEY)
 
     if identity is not None:
@@ -249,7 +265,56 @@ def load_pretrain_weights(model, weights_path):
     print(f"Initialized model weights from {weights_path}; starting a new training run.")
 
 
+def validate_distributed_environment(args: Args) -> None:
+    """Reject mismatched torchrun topology before starting distributed collectives."""
+    expected = args.num_nodes * args.devices
+    if args.num_nodes > 1 and "RANK" not in os.environ:
+        raise ValueError("Multi-node training requires torchrun on every node; use resume_sparks.py.")
+    if "RANK" in os.environ:
+        world = int(os.environ.get("WORLD_SIZE", "0"))
+        local = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
+        if world != expected or local != args.devices:
+            raise ValueError(
+                f"torchrun topology ({world} total, {local} local processes) does not match "
+                f"--num-nodes {args.num_nodes} --devices {args.devices}."
+            )
+
+
+def configure_resumed_early_stopping(checkpoint, *, patience, reset=False):
+    """Update only loaded callback bookkeeping; never rewrite the checkpoint file."""
+    import torch
+
+    callbacks = checkpoint.get("callbacks") or {}
+    stoppers = [state for key, state in callbacks.items() if key.startswith("RFDETREarlyStopping{")]
+    if len(stoppers) != 1:
+        if reset:
+            raise ValueError("Expected one RF-DETR early-stopping state in the resume checkpoint.")
+        return
+    state, = stoppers
+    state["patience"] = patience
+    if not reset:
+        return
+
+    # min_delta previously kept an older, lower baseline than the best saved EMA.
+    candidates = [state.get("best_score")]
+    for key, saved in callbacks.items():
+        if key.startswith("BestModelCallback{"):
+            candidates.extend(saved.get(name) for name in ("_best_ema", "_best_raw_regular", "best_model_score"))
+    scores = [float(value) for value in candidates if value is not None and math.isfinite(float(value))]
+    if not scores:
+        raise ValueError("The checkpoint has no finite historical best for early stopping.")
+    best = max(scores)
+    previous = state.get("best_score")
+    state.update(
+        wait_count=0, stopped_epoch=0, patience=patience,
+        best_score=previous.new_tensor(best) if isinstance(previous, torch.Tensor) else torch.tensor(best),
+        stopping_reason=0, stopping_reason_message=None,
+    )
+    print(f"Reset resumed early stopping: wait_count=0/{patience}, historical best mAP={best:.8f}.")
+
+
 def train(args: Args) -> None:
+    validate_distributed_environment(args)
     from pytorch_lightning.utilities.rank_zero import rank_zero_only
     from torch._dynamo import config as dynamo_config
     from rfdetr.config import RFDETRSegLargeConfig, SegmentationTrainConfig
@@ -267,6 +332,9 @@ def train(args: Args) -> None:
         def on_load_checkpoint(self, checkpoint):
             super().on_load_checkpoint(checkpoint)
             checkpoint["state_dict"] = align_compiled_state_dict(self, checkpoint["state_dict"])
+            configure_resumed_early_stopping(
+                checkpoint, patience=args.early_stopping_patience, reset=args.reset_early_stopping,
+            )
 
         def on_save_checkpoint(self, checkpoint):
             super().on_save_checkpoint(checkpoint)
@@ -304,7 +372,7 @@ def train(args: Args) -> None:
         resume=args.resume if rank_zero_only.rank == 0 else None,
         epochs=args.epochs,
         batch_size=args.batch_size,
-        grad_accum_steps=1,
+        grad_accum_steps=args.grad_accum_steps,
         eval_batch_size=1,
         eval_max_dets=100,
         eval_backend="faster_coco_eval",
@@ -331,7 +399,8 @@ def train(args: Args) -> None:
         multi_scale="per-batch",
         expanded_scales=True,
         early_stopping=True,
-        early_stopping_patience=10,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
         run_test=False,
         progress_bar="tqdm",
         train_log_on_step=True,
@@ -346,7 +415,7 @@ def train(args: Args) -> None:
     build_model = partial(build_model_from_config, defaults=defaults)
     with ExitStack() as stack:
         stack.enter_context(patch.object(module_model, "build_model_from_config", build_model))
-        if args.pretrain_weights is not None:
+        if args.pretrain_weights is not None or args.resume is not None:
             # RF-DETR 1.11.2 otherwise downloads DINOv2 during construction,
             # even though the full network will be loaded from our checkpoint.
             backbone_builder = lwdetr.build_backbone
@@ -370,12 +439,14 @@ def train(args: Args) -> None:
     trainer = build_trainer(train_config, model_config, log_every_n_steps=1)
     if wandb_logger is not None:
         trainer.loggers = [*trainer.loggers, wandb_logger]
-    global_batch_size = args.batch_size * args.devices * args.num_nodes
+    global_batch_size = args.batch_size * args.devices * args.num_nodes * args.grad_accum_steps
     # Allow shape-specialized variants for the eleven training scales and
     # validation instead of falling back to eager after the default eight.
     compile_recompile_limit = max(dynamo_config.recompile_limit, 32)
     print(
-        f"RF-DETR-Seg Large | Car | 200 queries | batch {args.batch_size}/GPU, {global_batch_size} global "
+        f"RF-DETR-Seg Large | Car | 200 queries | {args.num_nodes} nodes x {args.devices} GPUs "
+        f"| microbatch {args.batch_size}/GPU x accumulation {args.grad_accum_steps} = {global_batch_size} effective "
+        f"| early stopping min_delta={args.early_stopping_min_delta}, patience={args.early_stopping_patience} "
         f"| train scales {TRAIN_RESOLUTIONS} | compile recompile limit {compile_recompile_limit}"
     )
     # RF-DETR 1.11.2 does not align compiled/uncompiled keys when restoring EMA.
