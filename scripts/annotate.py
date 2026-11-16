@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 IMAGE_SUFFIXES = {".bmp", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
 MODEL_ID = "facebook/sam3"
-CATEGORY = {"id": 1, "name": "passenger car"}
+CATEGORY = {"id": 1, "name": "car"}
 
 
 def collect_images(source: Path) -> tuple[Path, list[Path]]:
@@ -59,7 +59,7 @@ def annotate(root: Path, paths: list[Path]) -> dict:
         "categories": [CATEGORY.copy()],
     }
     with torch.inference_mode():
-        text_inputs = processor(text=CATEGORY["name"], return_tensors="pt").to(device)
+        text_inputs = processor(text="passenger car", return_tensors="pt").to(device)
         for image_id, path in enumerate(tqdm(paths, unit="image"), start=1):
             try:
                 with Image.open(path) as source:

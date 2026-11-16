@@ -20,8 +20,11 @@ class Args:
     output: Path
     dataset_dir: Path
     device: Literal["gpu", "cpu"] = "gpu"
+    annotations: Path | None = None
 
     def __post_init__(self) -> None:
+        if self.annotations is not None and not self.annotations.is_file():
+            raise ValueError(f"--annotations must point to a COCO JSON: {self.annotations}")
         if not self.checkpoint.is_file():
             raise ValueError(f"--checkpoint must point to a file: {self.checkpoint}")
         if self.output.is_dir() or not self.output.parent.is_dir():

@@ -1,16 +1,18 @@
-"""Train or fine-tune RF-DETR-Seg Large on Car boxes and instance masks.
+"""Train or fine-tune RF-DETR-Seg Large on Objects365 boxes and instance masks.
 
 Use the project's rfdetrn dependency group. Pass the output of
-scripts/add_objects365_car_masks.py as --dataset-dir. It adds SAM3 masks to the
-dataset from scripts/download_objects365_car.py, in the same train/valid
-COCO layout.
+scripts/add_objects365_masks.py as --dataset-dir. It adds SAM3 masks to the
+dataset from scripts/download_objects365.py, in the same train/valid COCO
+layout. All 365 classes are supported; the class count and names are inferred
+from the annotations. Subsets, including the Car-only dataset, are also supported.
 
 For fine-tuning on COCO Car, use the same train/valid layout and pass
---pretrain-weights with an Objects365 RF-DETR checkpoint. Only model weights
-are loaded; optimizer, EMA counters, early stopping and W&B start a new run.
+--pretrain-weights with a Car-only RF-DETR checkpoint. Checkpoints must have
+the same classes in the same label order as the target dataset. Only model
+weights are loaded; optimizer, EMA counters, early stopping and W&B start a new run.
 
 This is a fixed-architecture adaptation of RF-DETR v2, Table 6 and Appendix A.
-It keeps the public Seg Large preset's 200 queries and trains only Car. The
+It keeps the public Seg Large preset's 200 queries. The
 optimizer and EMA use the public RF-DETR implementation for details absent
 from the paper.
 
@@ -19,17 +21,24 @@ update is batch_size * devices * num_nodes * grad_accum_steps.
 
 Use --wandb-project to log metrics to W&B. The run identity is saved in the
 Lightning checkpoint, so --resume reconnects to it automatically.
+
+Attention defaults to FlashAttention 3 on Hopper when its optional package is
+available and passes a forward/backward check, otherwise to PyTorch SDPA.
+Use --attn-implementation sdpa to select SDPA explicitly.
 """
 
 from collections import OrderedDict
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import partial
+from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 import math
 import os
 from pathlib import Path
+from typing import Literal
 from unittest.mock import patch
+import warnings
 
 import tyro
 
@@ -45,7 +54,7 @@ WANDB_RUN_KEY = "objects365_wandb_run"
 
 @dataclass
 class Args:
-    # Car dataset in Roboflow COCO train/valid layout.
+    # Dataset with instance masks in Roboflow COCO train/valid layout.
     dataset_dir: Path
     # Directory for logs and checkpoints.
     output_dir: Path
@@ -73,6 +82,8 @@ class Args:
     num_workers: int = 4
     # Random seed.
     seed: int = 42
+    # Optional Hopper FA3 for backbone training; auto and FA3 both fall back to SDPA.
+    attn_implementation: Literal["auto", "flash_attention_3", "sdpa"] = "auto"
     # W&B project for online metric logging.
     wandb_project: str | None = None
     # W&B account or team that owns the project.
@@ -185,25 +196,158 @@ def load_dinov2(encoder, weights_path):
 
 
 def validate_annotations(train, valid):
+    reference_categories = {key: category["name"] for key, category in train.coco.cats.items()}
     for split, dataset in (("train", train), ("valid", valid)):
         categories = dataset.coco.cats
-        if len(categories) != 1 or next(iter(categories.values()))["name"].casefold() != "car":
-            raise ValueError(f"The {split} split must declare a single Car category.")
-        category_id = next(iter(categories))
-        if dataset.cat2label != {category_id: 0}:
-            raise ValueError(f"The {split} Car category must map to model label 0.")
+        if not categories:
+            raise ValueError(f"The {split} split must declare at least one category.")
+        if {key: category["name"] for key, category in categories.items()} != reference_categories:
+            raise ValueError("The train and valid splits must declare the same category IDs and names.")
+        expected_mapping = {category_id: label for label, category_id in enumerate(sorted(categories))}
+        if dataset.cat2label != expected_mapping:
+            raise ValueError(f"The {split} categories must map to contiguous model labels in category ID order.")
         if not dataset.coco.anns:
             raise ValueError(f"The {split} split has no instance annotations.")
         for annotation in dataset.coco.anns.values():
-            if annotation["category_id"] != category_id or not annotation.get("segmentation"):
+            if annotation["category_id"] not in categories or not annotation.get("segmentation"):
                 raise ValueError(
-                    f"Expected a Car annotation with an instance mask in {split} for ID {annotation['id']}. "
-                    "Use the output of scripts/add_objects365_car_masks.py."
+                    f"Expected a declared category and an instance mask in {split} for ID {annotation['id']}. "
+                    "Use the output of scripts/add_objects365_masks.py."
                 )
 
 
 def paper_scales(resolution, expanded_scales, patch_size, num_windows):
     return list(TRAIN_RESOLUTIONS)
+
+
+def load_flash_attention3():
+    """Accept both current and older FA3 package layouts; never require FA2."""
+    import torch
+
+    errors = []
+    for name in ("flash_attn_3.flash_attn_interface", "flash_attn_interface"):
+        try:
+            return import_module(name).flash_attn_func
+        except torch.OutOfMemoryError:
+            raise
+        except (ImportError, OSError, RuntimeError, AttributeError, TypeError, ValueError) as error:
+            errors.append(f"{name}: {error}")
+    raise ImportError("FlashAttention 3 is not installed or cannot be loaded (" + "; ".join(errors) + ").")
+
+
+def call_flash_attention3(flash_func, query, key, value):
+    import torch
+
+    # SDPA uses BHSD; FA3 uses BSHD. Keep autograd through both transposes.
+    output = flash_func(
+        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
+        softmax_scale=None, causal=False, deterministic=torch.are_deterministic_algorithms_enabled(),
+    )
+    # Older FA3 releases return auxiliary tensors along with the context.
+    if isinstance(output, tuple):
+        output = output[0]
+    return output.transpose(1, 2)
+
+
+def flash_attention3_compatible(query, key, value, dropout_p):
+    import torch
+
+    return (
+        query.is_cuda and query.dtype in (torch.float16, torch.bfloat16)
+        and key.device == value.device == query.device and key.dtype == value.dtype == query.dtype
+        and query.ndim == key.ndim == value.ndim == 4 and query.shape == key.shape == value.shape
+        and 0 < query.shape[-1] <= 256 and query.shape[-1] % 8 == 0
+        and dropout_p == 0.0 and torch.cuda.get_device_capability(query.device)[0] == 9
+    )
+
+
+def make_flash_attention3_dispatch(flash_func):
+    """Run FA3 with autograd, retaining the native SDPA path for unsupported calls."""
+    import torch
+    from torch.nn.functional import scaled_dot_product_attention
+
+    enabled = True
+
+    # Keep optional extension dispatch and runtime fallback outside compiled graphs.
+    # Q/K/V projections and the rest of the model can still use torch.compile.
+    @torch.compiler.disable
+    def attention(query, key, value, dropout_p):
+        nonlocal enabled
+        if enabled and flash_attention3_compatible(query, key, value, dropout_p):
+            try:
+                return call_flash_attention3(flash_func, query, key, value)
+            except torch.OutOfMemoryError:
+                raise
+            except (RuntimeError, ImportError, OSError, TypeError, ValueError) as error:
+                enabled = False
+                warnings.warn(f"FlashAttention 3 failed; using SDPA for this run: {error}", RuntimeWarning)
+        return scaled_dot_product_attention(query, key, value, dropout_p=dropout_p, is_causal=False)
+
+    return attention
+
+
+def probe_flash_attention3(flash_func, device):
+    """Check the Hopper BF16 training kernel, including Q/K/V gradients."""
+    import torch
+
+    # Probing must not advance the training RNG or leave parameter gradients behind.
+    with torch.random.fork_rng(devices=[device.index]), torch.enable_grad():
+        inputs = [torch.randn(1, 6, 16, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
+                  for _ in range(3)]
+        output = call_flash_attention3(flash_func, *inputs)
+        gradients = torch.autograd.grad(output.float().square().mean(), inputs)
+        if not all(torch.isfinite(value).all().item() for value in (output, *gradients)):
+            raise RuntimeError("FlashAttention 3 forward/backward produced non-finite values.")
+
+
+@contextmanager
+def hopper_attention(implementation):
+    """Temporarily adapt RF-DETR's DINOv2 attention without changing weight keys."""
+    import torch
+
+    if implementation == "sdpa":
+        print("Backbone attention: SDPA (requested).")
+        yield
+        return
+    if not torch.cuda.is_available():
+        print("Backbone attention: SDPA (CUDA unavailable).")
+        yield
+        return
+    # torchrun and Lightning's subprocess launcher set LOCAL_RANK before train().
+    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
+    if torch.cuda.get_device_capability(device)[0] != 9:
+        print("Backbone attention: SDPA (FlashAttention 3 requires Hopper, compute capability 9.x).")
+        yield
+        return
+    try:
+        flash_func = load_flash_attention3()
+        probe_flash_attention3(flash_func, device)
+    except torch.OutOfMemoryError:
+        raise
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
+        warnings.warn(f"FlashAttention 3 unavailable; using SDPA: {error}", RuntimeWarning)
+        print("Backbone attention: SDPA (FlashAttention 3 unavailable).")
+        yield
+        return
+
+    from rfdetr.models.backbone.dinov2_with_windowed_attn import Dinov2WithRegistersSdpaSelfAttention
+
+    attention = make_flash_attention3_dispatch(flash_func)
+    original_forward = Dinov2WithRegistersSdpaSelfAttention.forward
+
+    def forward(self, hidden_states, output_attentions=False):
+        if output_attentions:
+            return original_forward(self, hidden_states, output_attentions=output_attentions)
+        query = self.transpose_for_scores(self.query(hidden_states))
+        key = self.transpose_for_scores(self.key(hidden_states))
+        value = self.transpose_for_scores(self.value(hidden_states))
+        context = attention(query, key, value, self.attention_probs_dropout_prob if self.training else 0.0)
+        context = context.transpose(1, 2).contiguous().view(*hidden_states.shape[:-1], self.all_head_size)
+        return context, None
+
+    print("Backbone attention: FlashAttention 3 (Hopper BF16 forward/backward verified; SDPA fallback enabled).")
+    with patch.object(Dinov2WithRegistersSdpaSelfAttention, "forward", forward):
+        yield
 
 
 def align_compiled_state_dict(module, state_dict):
@@ -269,7 +413,7 @@ def validate_distributed_environment(args: Args) -> None:
     """Reject mismatched torchrun topology before starting distributed collectives."""
     expected = args.num_nodes * args.devices
     if args.num_nodes > 1 and "RANK" not in os.environ:
-        raise ValueError("Multi-node training requires torchrun on every node; use resume_sparks.py.")
+        raise ValueError("Multi-node training requires torchrun on every node: python -m torch.distributed.run ... train_objects365.py.")
     if "RANK" in os.environ:
         world = int(os.environ.get("WORLD_SIZE", "0"))
         local = int(os.environ.get("LOCAL_WORLD_SIZE", "0"))
@@ -349,14 +493,19 @@ def train(args: Args) -> None:
             if stage == "fit" and not already_built:
                 validate_annotations(self._dataset_train, self._dataset_val)
 
-    class CarPostProcess(PostProcess):
+    class ForegroundPostProcess(PostProcess):
+        def __init__(self, num_classes, **kwargs):
+            super().__init__(**kwargs)
+            self.num_classes = num_classes
+
         def forward(self, outputs, target_sizes, score_threshold=None):
-            # Keep only the Car logit before ranking predictions for COCO AP.
-            car_outputs = {**outputs, "pred_logits": outputs["pred_logits"][..., :1]}
-            return super().forward(car_outputs, target_sizes, score_threshold)
+            # RF-DETR adds a background slot after the dataset's foreground classes.
+            foreground_outputs = {
+                **outputs, "pred_logits": outputs["pred_logits"][..., :self.num_classes].contiguous(),
+            }
+            return super().forward(foreground_outputs, target_sizes, score_threshold)
 
     model_config = RFDETRSegLargeConfig(
-        num_classes=1,
         num_queries=200,
         num_select=200,
         pretrain_weights=None,
@@ -409,6 +558,13 @@ def train(args: Args) -> None:
         tensorboard=False,
     )
     seed_everything(args.seed, workers=True)
+    # Build the datasets once before the model so the head and criterion use the
+    # actual label space, without loading another copy of the full COCO JSON.
+    data = Objects365DataModule(model_config, train_config)
+    with patch.object(coco, "compute_multi_scale_scales", paper_scales):
+        data.setup("fit")
+    model_config.num_classes = len(data._dataset_train.cat2label)
+    train_config.class_names = data.class_names
     # Route windowed attention at the blocks named in Appendix A. Keep the
     # released Large preset's feature taps, which are indexed separately.
     defaults = ModelDefaults(window_block_indexes=list(WINDOW_BLOCKS))
@@ -428,14 +584,15 @@ def train(args: Args) -> None:
     # RF-DETR defaults to permissive loading, which can silently skip all live
     # model weights when resuming across a change to torch.compile.
     model.strict_loading = True
-    model.postprocess = CarPostProcess(num_select=train_config.eval_max_dets)
+    model.postprocess = ForegroundPostProcess(
+        num_classes=model_config.num_classes, num_select=train_config.eval_max_dets,
+    )
 
     if args.pretrain_weights is not None:
         load_pretrain_weights(model.model, args.pretrain_weights)
     elif args.resume is None:
         load_dinov2(model.model.backbone[0].encoder.encoder, args.dinov2_weights)
 
-    data = Objects365DataModule(model_config, train_config)
     trainer = build_trainer(train_config, model_config, log_every_n_steps=1)
     if wandb_logger is not None:
         trainer.loggers = [*trainer.loggers, wandb_logger]
@@ -444,7 +601,7 @@ def train(args: Args) -> None:
     # validation instead of falling back to eager after the default eight.
     compile_recompile_limit = max(dynamo_config.recompile_limit, 32)
     print(
-        f"RF-DETR-Seg Large | Car | 200 queries | {args.num_nodes} nodes x {args.devices} GPUs "
+        f"RF-DETR-Seg Large | {model_config.num_classes} classes | 200 queries | {args.num_nodes} nodes x {args.devices} GPUs "
         f"| microbatch {args.batch_size}/GPU x accumulation {args.grad_accum_steps} = {global_batch_size} effective "
         f"| early stopping min_delta={args.early_stopping_min_delta}, patience={args.early_stopping_patience} "
         f"| train scales {TRAIN_RESOLUTIONS} | compile recompile limit {compile_recompile_limit}"
@@ -458,6 +615,7 @@ def train(args: Args) -> None:
     # Supply the same scale grid to the native dataset transforms and batch
     # resize hook. RF-DETR samples by optimizer step, shared across DDP ranks.
     with (
+        hopper_attention(args.attn_implementation),
         patch.object(coco, "compute_multi_scale_scales", paper_scales),
         patch.object(module_model, "compute_multi_scale_scales", paper_scales),
         patch.object(RFDETREMACallback, "_load_ema_weights", load_ema_weights),
