@@ -74,13 +74,14 @@ def build_image_index(path, split, root, ijson):
     return destination
 
 
-def download_images(db, split, output, workers):
+def download_images(db, split, output, workers, skip_invalid_images=False):
     """Bound in-flight metadata to the number of active archive transfers."""
     patches = iter(row[0] for row in db.execute("SELECT DISTINCT patch FROM images ORDER BY patch"))
     missing = set()
+    invalid = {}
     stop = Event()
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        jobs = set()
+        jobs = {}
 
         def submit_next():
             patch = next(patches, None)
@@ -92,7 +93,9 @@ def download_images(db, split, output, workers):
                     "SELECT name, width, height FROM images WHERE patch = ?", (patch,)
                 )
             }
-            jobs.add(executor.submit(source.download_patch, patch, selected, output, stop))
+            rejected = {} if skip_invalid_images else None
+            job = executor.submit(source.download_patch, patch, selected, output, stop, invalid_images=rejected)
+            jobs[job] = rejected
 
         try:
             for _ in range(workers):
@@ -100,8 +103,10 @@ def download_images(db, split, output, workers):
             while jobs:
                 completed, _ = wait(jobs, return_when=FIRST_COMPLETED)
                 for job in completed:
-                    jobs.remove(job)
+                    rejected = jobs.pop(job)
                     missing.update(job.result())
+                    if rejected:
+                        invalid.update(rejected)
                     submit_next()
         except BaseException:
             stop.set()
@@ -111,16 +116,16 @@ def download_images(db, split, output, workers):
     allowed_missing = source.KNOWN_MISSING_TRAIN if split == "train" else set()
     if not missing <= allowed_missing:
         raise ValueError(f"{split}: unexpected missing images: {sorted(missing)}")
-    return missing
+    return missing, invalid
 
 
-def write_coco(path, split, db, categories, missing, output, ijson):
-    """Write a JSON record at a time, excluding only documented absent JPEGs."""
+def write_coco(path, split, db, categories, excluded, output, ijson):
+    """Write a JSON record at a time, excluding unavailable images and their boxes."""
     image_ids = {
-        image_id for image_id, name in db.execute("SELECT id, name FROM images") if name not in missing
+        image_id for image_id, name in db.execute("SELECT id, name FROM images") if name not in excluded
     }
     excluded_ids = {
-        image_id for image_id, name in db.execute("SELECT id, name FROM images") if name in missing
+        image_id for image_id, name in db.execute("SELECT id, name FROM images") if name in excluded
     }
     category_ids = {row["id"] for row in categories}
     counts = {"images": 0, "annotations": 0, "excluded_annotations": 0}
@@ -162,7 +167,7 @@ def write_coco(path, split, db, categories, missing, output, ijson):
     return counts
 
 
-def download_split(split, root, workers, ijson, expected_categories=None):
+def download_split(split, root, workers, ijson, expected_categories=None, *, skip_invalid_images=False):
     path = source.annotation_path(root, split)
     print(f"{split}: reading all 365 categories and image metadata", flush=True)
     categories = read_categories(path, split, ijson)
@@ -173,17 +178,22 @@ def download_split(split, root, workers, ijson, expected_categories=None):
     output.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(index)
     try:
-        missing = download_images(db, split, output, workers)
-        counts = write_coco(path, split, db, categories, missing, output, ijson)
+        missing, invalid = download_images(db, split, output, workers, skip_invalid_images)
+        counts = write_coco(path, split, db, categories, missing | invalid.keys(), output, ijson)
     finally:
         db.close()
-    summary = {"split": split, "categories": len(categories), **counts, "missing_images": sorted(missing)}
+    summary = {
+        "split": split, "categories": len(categories), **counts,
+        "missing_images": sorted(missing), "invalid_images": invalid,
+    }
     report = root / ".objects365-source" / f"{split}-download.json"
     with source.atomic_output(report) as temporary:
         temporary.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"{output}: {counts['images']:,} JPEGs, {counts['annotations']:,} boxes, 365 classes", flush=True)
     if missing:
         print(f"{split}: excluded documented unavailable JPEGs: {', '.join(sorted(missing))}", flush=True)
+    if invalid:
+        print(f"{split}: excluded {len(invalid):,} invalid images and their boxes; details in {report}", flush=True)
     return categories
 
 
@@ -197,6 +207,11 @@ def main():
     parser.add_argument("--output", type=Path, required=True, help="Dataset output directory")
     parser.add_argument("--workers", type=int, default=4, help="Concurrent image archive transfers (default: 4)")
     parser.add_argument("--splits", nargs="+", choices=tuple(source.SPLITS), default=list(source.SPLITS))
+    parser.add_argument(
+        "--skip-invalid-images", action="store_true",
+        help="After 3 attempts, exclude images with unreadable headers, non-JPEG format or unexpected "
+        "dimensions, along with their boxes. Record details in .objects365-source/*-download.json.",
+    )
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers must be positive")
@@ -212,7 +227,10 @@ def main():
         print("Resume with the same command; existing valid JPEGs will be reused.", flush=True)
         categories = None
         for split in dict.fromkeys(args.splits):
-            categories = download_split(split, args.output, args.workers, ijson, categories)
+            categories = download_split(
+                split, args.output, args.workers, ijson, categories,
+                skip_invalid_images=args.skip_invalid_images,
+            )
     except (ValueError, OSError, EOFError, RuntimeError, source.HTTPException,
             source.tarfile.TarError, sqlite3.Error, ijson.JSONError) as exc:
         parser.exit(1, f"Error: {exc}\n")
