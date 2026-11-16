@@ -1,4 +1,4 @@
-"""Add SAM3 masks to every annotated class in Roboflow COCO train/ and valid/."""
+"""Add SAM3 masks to every annotated class in Roboflow COCO train/ and valid/, with bbox masks for crowds."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -461,6 +461,10 @@ def prepare_batch(args, batch):
             continue
         prompts, results = [], {}
         for row in rows:
+            if row.get("iscrowd", 0) == 1:
+                # Rasterize on export, also when resuming checkpoints made before crowd handling.
+                results[str(row["id"])] = {"crowd_bbox": True}
+                continue
             box = prompt_box(row.get("bbox"), record["width"], record["height"])
             if box is None:
                 results[str(row["id"])] = {"discard_reason": f"unusable box {row.get('bbox')!r}"}
@@ -640,14 +644,25 @@ def open_progress(db, identity):
     db.commit()
 
 
-def write_split(index, db, args, split, target, stale_images, progress):
+def bbox_fallback(record, row):
+    import numpy as np
+
+    box = prompt_box(row.get("bbox"), record["width"], record["height"])
+    if box is None:
+        raise ValueError(f"Image ID {record['id']}, annotation ID {row['id']}: "
+                         f"cannot create a nonempty bbox fallback from {row.get('bbox')!r}")
+    x1, y1, x2, y2 = box
+    mask = np.zeros((record["height"], record["width"]), dtype=bool)
+    mask[floor(y1):ceil(y2), floor(x1):ceil(x2)] = True
+    return encode_mask(mask)
+
+
+def write_split(index, db, args, split, target, progress):
     from pycocotools import mask as mask_utils
 
     metadata = json.loads(index.execute("SELECT metadata FROM splits WHERE name=?", (split,)).fetchone()[0])
-    count = kept = discarded = recovered = 0
-    # Image IDs stay on disk too; no list of 1.8 million image dictionaries is built.
-    db.execute("CREATE TEMP TABLE IF NOT EXISTS kept_images (image_id INTEGER PRIMARY KEY)")
-    db.execute("DELETE FROM kept_images")
+    names = {row["id"]: row["name"] for row in metadata["categories"]}
+    count = mask_count = kept = recovered = fake = crowd = 0
     with target.open("w", encoding="utf-8") as stream:
         stream.write(dumps(metadata)[:-1] + ',"annotations":[')
         for image_id, payload in index.execute(
@@ -670,46 +685,50 @@ def write_split(index, db, args, split, target, stale_images, progress):
             annotations = []
             for row in rows:
                 result = results[str(row["id"])]
-                if "discard_reason" in result:
-                    message = f"{split}: annotation ID {row['id']} (image ID {image_id}): {result['discard_reason']}"
-                    if args.on_missing == "error":
-                        raise ValueError(message + ". No JSONs published. Use --on-missing drop to allow exclusions.")
-                    tqdm.write(message, file=sys.stderr)
-                    discarded += 1
-                    continue
+                if row.get("iscrowd", 0) == 1:
+                    tqdm.write(
+                        f"CROWD_BBOX_MASK split={split} image_id={image_id} file={record['file_name']!r} "
+                        f"annotation_id={row['id']} category_id={row['category_id']} "
+                        f"class={names[row['category_id']]!r} reason=iscrowd=1", file=sys.stderr,
+                    )
+                    result = bbox_fallback(record, row)
+                    crowd += 1
+                elif "discard_reason" in result:
+                    tqdm.write(
+                        f"BBOX_MASK_FALLBACK split={split} image_id={image_id} file={record['file_name']!r} "
+                        f"annotation_id={row['id']} category_id={row['category_id']} "
+                        f"class={names[row['category_id']]!r} reason={result['discard_reason']}", file=sys.stderr,
+                    )
+                    result = bbox_fallback(record, row)
+                    fake += 1
                 rle, area = result["segmentation"], result["area"]
                 if (rle["size"] != [record["height"], record["width"]] or not isinstance(rle["counts"], str)
                         or not 0 < area <= record["height"] * record["width"] or mask_utils.area(rle) != area):
                     raise ValueError(f"{split}: invalid RLE or area for annotation ID {row['id']}")
                 annotations.append({**row, "segmentation": rle, "area": area})
                 recovered += result.get("recovered_on_crop", False)
-            missing = len(rows) - len(annotations)
-            excluded = missing > 0 if split == "valid" else bool(rows and not annotations)
-            if excluded:
-                tqdm.write(f"{split}: excluded image ID {image_id}: {missing}/{len(rows)} missing masks", file=sys.stderr)
-                if target_image.is_file() or target_image.is_symlink():
-                    stale_images.append(target_image)
-            else:
-                materialize_image(source, target_image, stamp)
-                read_image(target_image, record, pixels=False)
-                db.execute("INSERT INTO kept_images VALUES (?)", (image_id,))
-                kept += 1
-                for row in annotations:
-                    if count:
-                        stream.write(",")
-                    stream.write(dumps(row))
-                    count += 1
+            materialize_image(source, target_image, stamp)
+            read_image(target_image, record, pixels=False)
+            kept += 1
+            for row in annotations:
+                if count:
+                    stream.write(",")
+                stream.write(dumps(row))
+                count += 1
+                mask_count += 1
             progress.update()
         stream.write('],"images":[')
         separator = ""
-        for image_id, payload in index.execute(
-            "SELECT image_id, payload FROM images WHERE split=? ORDER BY ordinal", (split,),
+        for (payload,) in index.execute(
+            "SELECT payload FROM images WHERE split=? ORDER BY ordinal", (split,),
         ):
-            if db.execute("SELECT 1 FROM kept_images WHERE image_id=?", (image_id,)).fetchone():
-                stream.write(separator + payload)
-                separator = ","
+            stream.write(separator + payload)
+            separator = ","
         stream.write("]}\n")
-    return f"{split}: {kept} images, {count} masks; {discarded} annotations discarded; {recovered} recovered on crops"
+    return (f"{split}: {kept} images, {count} annotations, {mask_count} masks; "
+            f"{fake} rectangular bbox fallback masks; "
+            f"{crowd} rectangular crowd masks; "
+            f"{recovered} recovered on crops")
 
 
 def run(args):
@@ -789,13 +808,11 @@ def run(args):
             for split in SPLITS:
                 if source_stamp(args.input / split / COCO_FILE) != stamps[split]:
                     raise OSError(f"{split}: source JSON changed during inference")
-            summaries, stale_images = [], []
+            summaries = []
             with tqdm(desc="COCO export", **bar_options) as progress, ExitStack() as stack:
                 for split in SPLITS:
                     target = stack.enter_context(atomic_output(args.output / split / COCO_FILE))
-                    summaries.append(write_split(index, db, args, split, target, stale_images, progress))
-            for path in stale_images:
-                path.unlink(missing_ok=True)
+                    summaries.append(write_split(index, db, args, split, target, progress))
             for summary in summaries:
                 print(summary, flush=True)
 
@@ -805,6 +822,8 @@ def main():
         description=__doc__,
         epilog="Requires Python 3.12+, the sam dependency group and Hugging Face access to facebook/sam3. "
         "Uses the existing annotation bbox AND its category name; preserves original IDs, classes and bboxes. "
+        "Crowd annotations (iscrowd=1) use rectangular bbox masks without SAM3 and log each case. "
+        "Failed SAM3 masks automatically use rectangular bbox masks after crop retry, with a log for each fallback. "
         "Re-run with the same input/output to resume, including with a different number of GPUs.",
     )
     parser.add_argument("--input", required=True, type=Path, help="Roboflow COCO root containing train/ and valid/")
@@ -826,9 +845,6 @@ def main():
                         help="Allow TF32 for remaining FP32 CUDA operations (default: enabled)")
     parser.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=True,
                         help="Read/decode the next image batch during GPU inference (default: enabled)")
-    parser.add_argument("--on-missing", choices=("error", "drop"), default="error",
-                        help="After crop retry: stop export, or drop failed annotations (default: error). "
-                             "drop excludes valid images with any missing mask and train images losing all annotations")
     args = parser.parse_args()
     if args.batch_size < 1 or args.image_batch_size < 1:
         parser.error("--batch-size and --image-batch-size must be positive")
