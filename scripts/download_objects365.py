@@ -10,6 +10,7 @@ Requires this file and the adjacent download_objects365_car.py helper.
 
 import argparse
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from inspect import signature
 import json
 from pathlib import Path, PurePosixPath
 import sqlite3
@@ -22,6 +23,19 @@ else:
 
 
 JSON_OPTIONS = {"separators": (",", ":"), "allow_nan": False}
+
+
+def check_source_compatibility():
+    """Reject an outdated companion script before downloading or indexing data."""
+    try:
+        signature(source.download_patch).bind(None, None, None, None, invalid_images=None)
+    except TypeError as exc:
+        raise RuntimeError(
+            f"Outdated helper: {Path(source.__file__).resolve()}. "
+            "Update BOTH download_objects365.py and download_objects365_car.py in the same scripts directory. "
+            "download_patch must accept the keyword argument 'invalid_images'. "
+            "Then rerun the same command with the same --output; valid existing images will be reused."
+        ) from exc
 
 
 def read_categories(path, split, ijson):
@@ -220,6 +234,7 @@ def main():
     except ImportError:
         parser.exit(1, "Install dependencies: python -m pip install ijson pillow\n")
     try:
+        check_source_compatibility()
         args.output.mkdir(parents=True, exist_ok=True)
         source.check_space(args.output)
         print("Objects365 v2: ALL 365 classes; train + validation by default.", flush=True)
