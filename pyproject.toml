@@ -12,6 +12,16 @@ dependencies = [
     "tyro",
 ]
 
+[project.optional-dependencies]
+caption-audit = [
+    "numpy",
+    "qdrant-client",
+    "pandas",
+    "matplotlib",
+    "jupyterlab",
+    "ipykernel",
+]
+
 [dependency-groups]
 llm-lora-cu130 = [
     "unsloth",
@@ -28,11 +38,12 @@ rfdetrn = [
     "pyyaml",
 ]
 sam = [
+    "ijson",
     "numpy",
     "pycocotools",
     "torch",
     "torchvision",
-    "transformers>=5,<6",
+    "transformers>=5.17,<6",
 ]
 
 [tool.uv.sources]
