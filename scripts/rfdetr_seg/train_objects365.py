@@ -7,8 +7,11 @@ layout. All 365 classes are supported; the class count and names are inferred
 from the annotations. Subsets, including the Car-only dataset, are also supported.
 
 For fine-tuning on COCO Car, use the same train/valid layout and pass
---pretrain-weights with a Car-only RF-DETR checkpoint. Checkpoints must have
-the same classes in the same label order as the target dataset. Only model
+--pretrain-weights with the Objects365 RF-DETR checkpoint. Only a destination
+dataset declaring the single class Car can reduce a larger classification head:
+all classifiers copy the learned Car weights/bias and the background slot using
+the checkpoint's class_names. Objects365 keeps its complete dataset-defined head.
+With the same class count, checkpoints must have the same label order. Only model
 weights are loaded; optimizer, EMA counters, early stopping and W&B start a new run.
 
 This is a fixed-architecture adaptation of RF-DETR v2, Table 6 and Appendix A.
@@ -244,8 +247,8 @@ def align_compiled_state_dict(module, state_dict):
     return aligned
 
 
-def load_pretrain_weights(model, weights_path):
-    """Load only network weights, keeping the new run's training state fresh."""
+def load_pretrain_weights(model, weights_path, *, target_class_names=None):
+    """Transfer weights strictly; only a Car-only target selects pretrained Car rows."""
     import torch
 
     checkpoint = torch.load(weights_path, map_location="cpu", weights_only=True)
@@ -274,7 +277,80 @@ def load_pretrain_weights(model, weights_path):
         raise ValueError("Expected an RF-DETR checkpoint with 'model' or 'state_dict' weights.")
     if not isinstance(state, dict) or not state:
         raise ValueError("The checkpoint contains no model weights.")
-    model.load_state_dict(align_compiled_state_dict(model, state), strict=True)
+    state = align_compiled_state_dict(model, state)
+    # Copy the mapping so filtering never changes an aliased checkpoint payload.
+    metadata = getattr(state, "_metadata", None)
+    state = OrderedDict(state)
+    if metadata is not None:
+        state._metadata = metadata
+    target = model.state_dict()
+
+    def classifier_parameter(key):
+        parts = [part for part in key.split(".") if part != "_orig_mod"]
+        return (
+            len(parts) == 2 and parts[0] == "class_embed" and parts[1] in {"weight", "bias"}
+        ) or (
+            len(parts) == 4 and parts[:2] == ["transformer", "enc_out_class_embed"]
+            and parts[2].isdigit() and parts[3] in {"weight", "bias"}
+        )
+
+    head_key = next((key for key in target if key.replace("_orig_mod.", "") == "class_embed.weight"), None)
+    if head_key is not None and head_key in state:
+        source_outputs = state[head_key].shape[0]
+        target_outputs = target[head_key].shape[0]
+        if source_outputs != target_outputs:
+            car_only = (
+                target_outputs == 2 and target_class_names is not None
+                and len(target_class_names) == 1 and isinstance(target_class_names[0], str)
+                and target_class_names[0].strip().casefold() == "car"
+            )
+            if not car_only:
+                raise ValueError(
+                    "Checkpoint and dataset class counts differ. Automatic head reduction is supported only "
+                    "for a destination dataset declaring the single class Car."
+                )
+            source_names = None
+            for settings in (checkpoint.get("args"), checkpoint.get("hyper_parameters")):
+                if isinstance(settings, dict):
+                    source_names = settings.get("class_names")
+                    nested = settings.get("train_config")
+                    if source_names is None and isinstance(nested, dict):
+                        source_names = nested.get("class_names")
+                    if source_names is not None:
+                        break
+            if (
+                not isinstance(source_names, (list, tuple)) or len(source_names) != source_outputs - 1
+                or any(not isinstance(name, str) or not name.strip() for name in source_names)
+            ):
+                raise ValueError(
+                    "Car head reduction requires checkpoint class_names in model label order, with one name "
+                    "per foreground output (excluding background). Cannot infer the Car row safely."
+                )
+            car_labels = [index for index, name in enumerate(source_names) if name.strip().casefold() == "car"]
+            if len(car_labels) != 1:
+                raise ValueError("Checkpoint class_names must contain exactly one unambiguous Car class.")
+            selected_rows = [car_labels[0], source_outputs - 1]
+            # Copy learned Car weights AND bias in every decoder/encoder
+            # classifier; the final background slot follows Car. Class IDs can
+            # differ across datasets, so never truncate or assume Car is row 0.
+            for key, value in target.items():
+                if classifier_parameter(key) and key in state:
+                    source = state[key]
+                    if source.shape != (source_outputs, *value.shape[1:]):
+                        raise RuntimeError(f"Incompatible classification parameter {key}: {source.shape}.")
+                    state[key] = source[selected_rows]
+            print(
+                f"Transferred classification heads: {source_outputs - 1} -> Car "
+                f"(source label {car_labels[0]}); copied learned Car weights/bias and background slot."
+            )
+
+    # FP8 checkpoints can carry Transformer Engine scaling history. Pretraining
+    # transfers weights into the ordinary model before Lightning's FP8 conversion;
+    # those runtime-only entries have no counterpart here and are not transferred.
+    for key in list(state):
+        if key.rsplit(".", 1)[-1] == "_extra_state" and key not in target:
+            del state[key]
+    model.load_state_dict(state, strict=True)
     print(f"Initialized model weights from {weights_path}; starting a new training run.")
 
 
@@ -459,7 +535,7 @@ def train(args: Args) -> None:
     )
 
     if args.pretrain_weights is not None:
-        load_pretrain_weights(model.model, args.pretrain_weights)
+        load_pretrain_weights(model.model, args.pretrain_weights, target_class_names=data.class_names)
     elif args.resume is None:
         load_dinov2(model.model.backbone[0].encoder.encoder, args.dinov2_weights)
 
