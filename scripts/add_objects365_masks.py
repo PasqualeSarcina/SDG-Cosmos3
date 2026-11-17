@@ -26,6 +26,7 @@ COCO_FILE = "_annotations.coco.json"
 SPLITS = ("train", "valid")
 JSON_OPTIONS = {"separators": (",", ":"), "allow_nan": False}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
+ATTENTION_BACKENDS = ("sdpa", "eager")
 
 
 def dumps(value):
@@ -266,12 +267,22 @@ class OptimizedCall:
         if enabled:
             try:
                 self.compiled = torch.compile(function, mode=mode, fullgraph=False, dynamic=False)
-            except torch.OutOfMemoryError:
-                raise
             except Exception as exc:
                 self.fallback(exc)
 
     def fallback(self, exc):
+        # Dynamo/Inductor can wrap a CUDA OOM in a compiler exception.
+        pending, seen = [exc], set()
+        while pending:
+            error = pending.pop()
+            if id(error) in seen:
+                continue
+            seen.add(id(error))
+            if isinstance(error, self.torch.OutOfMemoryError):
+                raise exc
+            pending.extend(cause for cause in (getattr(error, "inner_exception", None),
+                                               error.__cause__, error.__context__)
+                           if isinstance(cause, BaseException))
         self.compiled = None
         tqdm.write(f"SAM3 {self.name}: compile disabled; using eager execution: {exc}", file=sys.stderr)
 
@@ -281,20 +292,24 @@ class OptimizedCall:
                 # Encoder features are cloned before a decoder step can reuse graph memory.
                 self.torch.compiler.cudagraph_mark_step_begin()
                 return self.compiled(*args, **kwargs)
-            except self.torch.OutOfMemoryError:
-                raise
             except Exception as exc:
                 self.fallback(exc)
         return self.function(*args, **kwargs)
 
 
 def set_config_dtype(config, dtype):
-    """Propagate precision to nested backbones before Transformers checks FA3 support."""
+    """Propagate precision to nested backbones before loading the model."""
     config.dtype = dtype
     for name in config.sub_configs:
         child = getattr(config, name, None)
         if child is not None:
             set_config_dtype(child, dtype)
+
+
+def worker_cpu_threads(gpus):
+    """Share the job's CPU allocation across GPU workers, including their compilers."""
+    cpu_count = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
+    return max(1, min(4, cpu_count // (gpus or 1)))
 
 
 class Sam3:
@@ -314,17 +329,14 @@ class Sam3:
         self.dtype = getattr(torch, dtype)
         if self.device.type == "cpu" and self.dtype != torch.float32:
             raise ValueError("SAM3 bbox prompts require --dtype float32 on CPU (torchvision ROI Align limitation)")
-        self.batch_size = args.batch_size
+        self.batch_size, self.image_batch_size = args.batch_size, args.image_batch_size
         if self.device.type == "cuda":
             torch.set_float32_matmul_precision("high" if args.tf32 else "highest")
             torch.backends.cudnn.allow_tf32 = args.tf32
             torch.backends.cudnn.benchmark = True
         self.attn_implementation = args.attn_implementation
-        if self.attn_implementation == "flash_attention_3":
-            if self.device.type != "cuda" or self.dtype == torch.float32:
-                self.fallback_attention("FlashAttention 3 requires CUDA and --dtype bfloat16 or float16")
-            elif torch.cuda.get_device_capability(self.device)[0] != 9:
-                self.fallback_attention("FlashAttention 3 requires a Hopper GPU (compute capability 9.x)")
+        if self.attn_implementation not in ATTENTION_BACKENDS:
+            raise ValueError(f"--attn-implementation must be one of {ATTENTION_BACKENDS}")
         available = self.device.type == "cuda" and sys.platform.startswith("linux") and find_spec("triton") is not None
         if args.compile == "on" and not available:
             raise ValueError("--compile on requires Linux, CUDA and Triton; use --compile off on this platform")
@@ -332,54 +344,39 @@ class Sam3:
         self.processor = Sam3Processor.from_pretrained(MODEL_ID)
         config = AutoConfig.from_pretrained(MODEL_ID)
         set_config_dtype(config, self.dtype)
-        try:
-            self.model = Sam3Model.from_pretrained(
-                MODEL_ID, config=config, dtype=self.dtype, attn_implementation=self.attn_implementation,
-            )
-        except torch.OutOfMemoryError:
-            raise
-        except (ImportError, OSError, ValueError, RuntimeError) as exc:
-            if self.attn_implementation != "flash_attention_3":
-                raise
-            self.fallback_attention(exc)
-            self.model = Sam3Model.from_pretrained(MODEL_ID, config=config, dtype=self.dtype, attn_implementation="sdpa")
+        self.model = Sam3Model.from_pretrained(
+            MODEL_ID, config=config, dtype=self.dtype, attn_implementation=self.attn_implementation,
+        )
         self.model = self.model.to(self.device).eval()
         self.configure_runtime(enabled, args.compile_mode, getattr(args, "compile_scope", "all"),
-                               getattr(args, "compile_recompile_limit", 128))
-        compile_description = (f"{args.compile_mode}, scope={self.compile_scope}, variants={self.compile_recompile_limit}"
+                               getattr(args, "compile_recompile_limit", 128), getattr(args, "gpus", None))
+        compile_description = (f"{args.compile_mode}, scope={self.compile_scope}, variants={self.compile_recompile_limit}, "
+                               f"compiler threads={self.compile_threads}"
                                if enabled else "off")
         print(f"SAM3 [{self.device}]: dtype={dtype}, attention={self.attn_implementation}, "
               f"compile={compile_description}, text cache=on", flush=True)
 
-    def fallback_attention(self, reason):
-        self.attn_implementation = "sdpa"
-        tqdm.write(f"SAM3 [{self.device}]: FlashAttention 3 unavailable; falling back to SDPA: {reason}", file=sys.stderr)
-
-    def attention_call(self, function, *args, **kwargs):
-        try:
-            return function(*args, **kwargs)
-        except self.torch.OutOfMemoryError:
-            raise
-        except (ImportError, OSError, ValueError, RuntimeError) as exc:
-            if self.attn_implementation != "flash_attention_3":
-                raise
-            self.model.set_attn_implementation("sdpa")
-            self.fallback_attention(exc)
-            # Compiled graphs may still contain FA3 kernels; retry this stage without them.
-            self.encode_images.compiled = self.decode_prompts.compiled = None
-        return function(*args, **kwargs)
-
     def configure_runtime(self, compile_enabled=False, compile_mode="reduce-overhead", compile_scope="all",
-                          recompile_limit=128):
+                          recompile_limit=128, gpus=None):
         self.compile_scope, self.compile_recompile_limit = compile_scope, recompile_limit
+        self.compile_threads = None
         if compile_enabled:
             from torch._dynamo import config as dynamo_config
+            from torch._inductor import config as inductor_config
 
             # Static batch buckets, configuration types and AMP dtypes need separate variants.
-            # Keep a bounded cache as in Meta's SAM3 runtime, without suppressing compiler errors.
+            # Surface limit hits so the wrapper can log and disable the affected stage.
             dynamo_config.recompile_limit = recompile_limit
             dynamo_config.accumulated_recompile_limit = max(dynamo_config.accumulated_recompile_limit,
                                                            16 * recompile_limit)
+            dynamo_config.fail_on_recompile_limit_hit = True
+            dynamo_config.suppress_errors = False
+            # Each spawned GPU process owns an Inductor pool. Avoid N x 32 compiler
+            # subprocesses competing for the same node's CPU allocation and memory.
+            self.compile_threads = int(os.environ.get("TORCHINDUCTOR_COMPILE_THREADS", worker_cpu_threads(gpus)))
+            if self.compile_threads < 1:
+                raise ValueError("TORCHINDUCTOR_COMPILE_THREADS must be positive")
+            inductor_config.compile_threads = self.compile_threads
         self.text_cache = {}
         self.encode_images = OptimizedCall(
             self.torch, self.model.get_vision_features, compile_enabled, compile_mode, "image encoder",
@@ -399,7 +396,7 @@ class Sam3:
         missing = list(dict.fromkeys(text for text in texts if text not in self.text_cache))
         if missing:
             inputs = self.processor(text=missing, return_tensors="pt").to(self.device)
-            features = self.attention_call(self.model.get_text_features, **inputs, return_dict=True).pooler_output
+            features = self.model.get_text_features(**inputs, return_dict=True).pooler_output
             for index, text in enumerate(missing):
                 self.text_cache[text] = (features[index].detach().clone(), inputs["attention_mask"][index].clone())
         features = torch.stack([self.text_cache[text][0] for text in texts])
@@ -412,11 +409,16 @@ class Sam3:
         autocast = (torch.autocast(self.device.type, dtype=self.dtype)
                     if self.dtype != torch.float32 else nullcontext())
         with torch.inference_mode(), autocast:
-            pixel_values = self.processor(images=images, return_tensors="pt")["pixel_values"]
+            encoder_images = images
+            if self.encode_images.compiled is not None:
+                # Filtering cached/crowd-only images and crop retries also vary this batch.
+                bucket = min(self.image_batch_size, 1 << (len(images) - 1).bit_length())
+                encoder_images = [*images, *([images[-1]] * (bucket - len(images)))]
+            pixel_values = self.processor(images=encoder_images, return_tensors="pt")["pixel_values"]
             if self.device.type == "cuda":
                 pixel_values = pixel_values.pin_memory()
             pixel_values = pixel_values.to(self.device, dtype=self.dtype, non_blocking=self.device.type == "cuda")
-            vision = self.attention_call(self.encode_images, pixel_values=pixel_values)
+            vision = self.encode_images(pixel_values=pixel_values)
             if self.encode_images.compiled is not None:
                 # Own the features: subsequent CUDA Graph steps may overwrite encoder output buffers.
                 vision = type(vision)(
@@ -444,8 +446,7 @@ class Sam3:
                     width, height = images[index].size
                     boxes.append([[(x1 + x2) / (2 * width), (y1 + y2) / (2 * height),
                                    (x2 - x1) / width, (y2 - y1) / height]])
-                pred_masks, pred_logits = self.attention_call(
-                    self.decode_prompts,
+                pred_masks, pred_logits = self.decode_prompts(
                     vision_embeds=features, text_embeds=text_embeds, attention_mask=attention_mask,
                     input_boxes=torch.tensor(boxes, dtype=torch.float32, device=self.device),
                     input_boxes_labels=torch.ones(len(batch), 1, dtype=torch.long, device=self.device),
@@ -596,8 +597,7 @@ def iter_batches(index, progress_db, args):
 def infer_worker(args, pipe):
     import torch
 
-    cpu_count = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 1)
-    torch.set_num_threads(max(1, min(4, cpu_count // args.gpus)))
+    torch.set_num_threads(worker_cpu_threads(args.gpus))
     with pipe:
         predict = lazy_predict(args)
         pipe.send(("ready", None))
@@ -888,8 +888,8 @@ def main():
     parser.add_argument("--image-batch-size", default=1, type=int, help="Images per encoder pass, per GPU (default: 1)")
     parser.add_argument("--dtype", choices=("auto", "float32", "bfloat16", "float16"), default="auto",
                         help="Model/autocast precision; auto uses BF16 on supported CUDA GPUs, FP32 otherwise")
-    parser.add_argument("--attn-implementation", choices=("sdpa", "flash_attention_3", "eager"), default="sdpa",
-                        help="Attention backend (default: sdpa); FA3 falls back to SDPA if unavailable or incompatible")
+    parser.add_argument("--attn-implementation", choices=ATTENTION_BACKENDS, default="sdpa",
+                        help="Attention backend (default: sdpa, using PyTorch kernels)")
     parser.add_argument("--compile", choices=("auto", "on", "off"), default="auto",
                         help="Compile encoder and prompt decoder; auto enables on Linux CUDA with Triton")
     parser.add_argument("--compile-mode", choices=("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"),

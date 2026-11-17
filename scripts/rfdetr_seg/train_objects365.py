@@ -22,23 +22,20 @@ update is batch_size * devices * num_nodes * grad_accum_steps.
 Use --wandb-project to log metrics to W&B. The run identity is saved in the
 Lightning checkpoint, so --resume reconnects to it automatically.
 
-Attention defaults to FlashAttention 3 on Hopper when its optional package is
-available and passes a forward/backward check, otherwise to PyTorch SDPA.
-Use --attn-implementation sdpa to select SDPA explicitly.
+Backbone attention uses RF-DETR's native PyTorch SDPA implementation.
+Use --amp-dtype fp8 to opt into Transformer Engine training with the CUDA extra.
 """
 
 from collections import OrderedDict
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack
 from dataclasses import dataclass
 from functools import partial
-from importlib import import_module
 from importlib.metadata import PackageNotFoundError, version
 import math
 import os
 from pathlib import Path
 from typing import Literal
 from unittest.mock import patch
-import warnings
 
 import tyro
 
@@ -62,6 +59,8 @@ class Args:
     epochs: int = 60
     # Training images per GPU per microbatch.
     batch_size: int = 4
+    # Validation images per GPU, independent of the training microbatch.
+    eval_batch_size: int = 16
     # Microbatches accumulated before each optimizer update.
     grad_accum_steps: int = 1
     # Minimum absolute validation mAP improvement; zero accepts any strict increase.
@@ -82,8 +81,8 @@ class Args:
     num_workers: int = 4
     # Random seed.
     seed: int = 42
-    # Optional Hopper FA3 for backbone training; auto and FA3 both fall back to SDPA.
-    attn_implementation: Literal["auto", "flash_attention_3", "sdpa"] = "auto"
+    # Native RF-DETR precision; FP8 requires Transformer Engine and supported CUDA GPUs.
+    amp_dtype: Literal["auto", "bf16", "fp16", "fp8"] = "auto"
     # W&B project for online metric logging.
     wandb_project: str | None = None
     # W&B account or team that owns the project.
@@ -98,9 +97,9 @@ class Args:
     def __post_init__(self) -> None:
         if self.epochs < 1:
             raise ValueError("Epochs must be positive.")
-        if min(self.batch_size, self.devices, self.num_nodes, self.grad_accum_steps,
+        if min(self.batch_size, self.eval_batch_size, self.devices, self.num_nodes, self.grad_accum_steps,
                self.early_stopping_patience) < 1 or self.num_workers < 0:
-            raise ValueError("Batch size, devices, nodes, accumulation and patience must be positive. Workers must be nonnegative.")
+            raise ValueError("Batch sizes, devices, nodes, accumulation and patience must be positive. Workers must be nonnegative.")
         if not math.isfinite(self.early_stopping_min_delta) or self.early_stopping_min_delta < 0:
             raise ValueError("Early stopping min_delta must be finite and nonnegative.")
         if self.reset_early_stopping and self.resume is None:
@@ -218,136 +217,6 @@ def validate_annotations(train, valid):
 
 def paper_scales(resolution, expanded_scales, patch_size, num_windows):
     return list(TRAIN_RESOLUTIONS)
-
-
-def load_flash_attention3():
-    """Accept both current and older FA3 package layouts; never require FA2."""
-    import torch
-
-    errors = []
-    for name in ("flash_attn_3.flash_attn_interface", "flash_attn_interface"):
-        try:
-            return import_module(name).flash_attn_func
-        except torch.OutOfMemoryError:
-            raise
-        except (ImportError, OSError, RuntimeError, AttributeError, TypeError, ValueError) as error:
-            errors.append(f"{name}: {error}")
-    raise ImportError("FlashAttention 3 is not installed or cannot be loaded (" + "; ".join(errors) + ").")
-
-
-def call_flash_attention3(flash_func, query, key, value):
-    import torch
-
-    # SDPA uses BHSD; FA3 uses BSHD. Keep autograd through both transposes.
-    output = flash_func(
-        query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
-        softmax_scale=None, causal=False, deterministic=torch.are_deterministic_algorithms_enabled(),
-    )
-    # Older FA3 releases return auxiliary tensors along with the context.
-    if isinstance(output, tuple):
-        output = output[0]
-    return output.transpose(1, 2)
-
-
-def flash_attention3_compatible(query, key, value, dropout_p):
-    import torch
-
-    return (
-        query.is_cuda and query.dtype in (torch.float16, torch.bfloat16)
-        and key.device == value.device == query.device and key.dtype == value.dtype == query.dtype
-        and query.ndim == key.ndim == value.ndim == 4 and query.shape == key.shape == value.shape
-        and 0 < query.shape[-1] <= 256 and query.shape[-1] % 8 == 0
-        and dropout_p == 0.0 and torch.cuda.get_device_capability(query.device)[0] == 9
-    )
-
-
-def make_flash_attention3_dispatch(flash_func):
-    """Run FA3 with autograd, retaining the native SDPA path for unsupported calls."""
-    import torch
-    from torch.nn.functional import scaled_dot_product_attention
-
-    enabled = True
-
-    # Keep optional extension dispatch and runtime fallback outside compiled graphs.
-    # Q/K/V projections and the rest of the model can still use torch.compile.
-    @torch.compiler.disable
-    def attention(query, key, value, dropout_p):
-        nonlocal enabled
-        if enabled and flash_attention3_compatible(query, key, value, dropout_p):
-            try:
-                return call_flash_attention3(flash_func, query, key, value)
-            except torch.OutOfMemoryError:
-                raise
-            except (RuntimeError, ImportError, OSError, TypeError, ValueError) as error:
-                enabled = False
-                warnings.warn(f"FlashAttention 3 failed; using SDPA for this run: {error}", RuntimeWarning)
-        return scaled_dot_product_attention(query, key, value, dropout_p=dropout_p, is_causal=False)
-
-    return attention
-
-
-def probe_flash_attention3(flash_func, device):
-    """Check the Hopper BF16 training kernel, including Q/K/V gradients."""
-    import torch
-
-    # Probing must not advance the training RNG or leave parameter gradients behind.
-    with torch.random.fork_rng(devices=[device.index]), torch.enable_grad():
-        inputs = [torch.randn(1, 6, 16, 64, device=device, dtype=torch.bfloat16, requires_grad=True)
-                  for _ in range(3)]
-        output = call_flash_attention3(flash_func, *inputs)
-        gradients = torch.autograd.grad(output.float().square().mean(), inputs)
-        if not all(torch.isfinite(value).all().item() for value in (output, *gradients)):
-            raise RuntimeError("FlashAttention 3 forward/backward produced non-finite values.")
-
-
-@contextmanager
-def hopper_attention(implementation):
-    """Temporarily adapt RF-DETR's DINOv2 attention without changing weight keys."""
-    import torch
-
-    if implementation == "sdpa":
-        print("Backbone attention: SDPA (requested).")
-        yield
-        return
-    if not torch.cuda.is_available():
-        print("Backbone attention: SDPA (CUDA unavailable).")
-        yield
-        return
-    # torchrun and Lightning's subprocess launcher set LOCAL_RANK before train().
-    device = torch.device("cuda", int(os.environ.get("LOCAL_RANK", "0")))
-    if torch.cuda.get_device_capability(device)[0] != 9:
-        print("Backbone attention: SDPA (FlashAttention 3 requires Hopper, compute capability 9.x).")
-        yield
-        return
-    try:
-        flash_func = load_flash_attention3()
-        probe_flash_attention3(flash_func, device)
-    except torch.OutOfMemoryError:
-        raise
-    except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
-        warnings.warn(f"FlashAttention 3 unavailable; using SDPA: {error}", RuntimeWarning)
-        print("Backbone attention: SDPA (FlashAttention 3 unavailable).")
-        yield
-        return
-
-    from rfdetr.models.backbone.dinov2_with_windowed_attn import Dinov2WithRegistersSdpaSelfAttention
-
-    attention = make_flash_attention3_dispatch(flash_func)
-    original_forward = Dinov2WithRegistersSdpaSelfAttention.forward
-
-    def forward(self, hidden_states, output_attentions=False):
-        if output_attentions:
-            return original_forward(self, hidden_states, output_attentions=output_attentions)
-        query = self.transpose_for_scores(self.query(hidden_states))
-        key = self.transpose_for_scores(self.key(hidden_states))
-        value = self.transpose_for_scores(self.value(hidden_states))
-        context = attention(query, key, value, self.attention_probs_dropout_prob if self.training else 0.0)
-        context = context.transpose(1, 2).contiguous().view(*hidden_states.shape[:-1], self.all_head_size)
-        return context, None
-
-    print("Backbone attention: FlashAttention 3 (Hopper BF16 forward/backward verified; SDPA fallback enabled).")
-    with patch.object(Dinov2WithRegistersSdpaSelfAttention, "forward", forward):
-        yield
 
 
 def align_compiled_state_dict(module, state_dict):
@@ -522,7 +391,7 @@ def train(args: Args) -> None:
         epochs=args.epochs,
         batch_size=args.batch_size,
         grad_accum_steps=args.grad_accum_steps,
-        eval_batch_size=1,
+        eval_batch_size=args.eval_batch_size,
         eval_max_dets=100,
         eval_backend="faster_coco_eval",
         compute_val_loss=True,
@@ -533,6 +402,7 @@ def train(args: Args) -> None:
         num_nodes=args.num_nodes,
         strategy="ddp" if args.devices * args.num_nodes > 1 else "auto",
         seed=args.seed,
+        amp_dtype=args.amp_dtype,
         lr=args.lr,
         lr_encoder=args.lr_encoder,
         lr_vit_layer_decay=0.8,
@@ -603,6 +473,8 @@ def train(args: Args) -> None:
     print(
         f"RF-DETR-Seg Large | {model_config.num_classes} classes | 200 queries | {args.num_nodes} nodes x {args.devices} GPUs "
         f"| microbatch {args.batch_size}/GPU x accumulation {args.grad_accum_steps} = {global_batch_size} effective "
+        f"| validation batch {args.eval_batch_size}/GPU "
+        f"| AMP {args.amp_dtype} "
         f"| early stopping min_delta={args.early_stopping_min_delta}, patience={args.early_stopping_patience} "
         f"| train scales {TRAIN_RESOLUTIONS} | compile recompile limit {compile_recompile_limit}"
     )
@@ -615,7 +487,6 @@ def train(args: Args) -> None:
     # Supply the same scale grid to the native dataset transforms and batch
     # resize hook. RF-DETR samples by optimizer step, shared across DDP ranks.
     with (
-        hopper_attention(args.attn_implementation),
         patch.object(coco, "compute_multi_scale_scales", paper_scales),
         patch.object(module_model, "compute_multi_scale_scales", paper_scales),
         patch.object(RFDETREMACallback, "_load_ema_weights", load_ema_weights),

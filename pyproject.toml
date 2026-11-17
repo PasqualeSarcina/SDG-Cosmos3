@@ -37,6 +37,11 @@ rfdetrn = [
     "wandb==0.25.0",
     "pyyaml",
 ]
+rfdetrn-fp8 = [
+    { include-group = "rfdetrn" },
+    # RF-DETR installs Transformer Engine's PyTorch extension on Linux x86-64.
+    "rfdetr[cuda]==1.11.2",
+]
 sam = [
     "ijson",
     "numpy",
