@@ -288,10 +288,19 @@ class OptimizedCall:
         return self.function(*args, **kwargs)
 
 
+def set_config_dtype(config, dtype):
+    """Propagate precision to nested backbones before Transformers checks FA3 support."""
+    config.dtype = dtype
+    for name in config.sub_configs:
+        child = getattr(config, name, None)
+        if child is not None:
+            set_config_dtype(child, dtype)
+
+
 class Sam3:
     def __init__(self, args):
         import torch
-        from transformers import Sam3Model, Sam3Processor
+        from transformers import AutoConfig, Sam3Model, Sam3Processor
 
         self.torch = torch
         self.device = torch.device(("cuda" if torch.cuda.is_available() else "cpu")
@@ -321,9 +330,11 @@ class Sam3:
             raise ValueError("--compile on requires Linux, CUDA and Triton; use --compile off on this platform")
         enabled = args.compile != "off" and available
         self.processor = Sam3Processor.from_pretrained(MODEL_ID)
+        config = AutoConfig.from_pretrained(MODEL_ID)
+        set_config_dtype(config, self.dtype)
         try:
             self.model = Sam3Model.from_pretrained(
-                MODEL_ID, dtype=self.dtype, attn_implementation=self.attn_implementation,
+                MODEL_ID, config=config, dtype=self.dtype, attn_implementation=self.attn_implementation,
             )
         except torch.OutOfMemoryError:
             raise
@@ -331,11 +342,14 @@ class Sam3:
             if self.attn_implementation != "flash_attention_3":
                 raise
             self.fallback_attention(exc)
-            self.model = Sam3Model.from_pretrained(MODEL_ID, dtype=self.dtype, attn_implementation="sdpa")
+            self.model = Sam3Model.from_pretrained(MODEL_ID, config=config, dtype=self.dtype, attn_implementation="sdpa")
         self.model = self.model.to(self.device).eval()
-        self.configure_runtime(enabled, args.compile_mode)
+        self.configure_runtime(enabled, args.compile_mode, getattr(args, "compile_scope", "all"),
+                               getattr(args, "compile_recompile_limit", 128))
+        compile_description = (f"{args.compile_mode}, scope={self.compile_scope}, variants={self.compile_recompile_limit}"
+                               if enabled else "off")
         print(f"SAM3 [{self.device}]: dtype={dtype}, attention={self.attn_implementation}, "
-              f"compile={args.compile_mode if enabled else 'off'}, text cache=on", flush=True)
+              f"compile={compile_description}, text cache=on", flush=True)
 
     def fallback_attention(self, reason):
         self.attn_implementation = "sdpa"
@@ -355,7 +369,17 @@ class Sam3:
             self.encode_images.compiled = self.decode_prompts.compiled = None
         return function(*args, **kwargs)
 
-    def configure_runtime(self, compile_enabled=False, compile_mode="reduce-overhead"):
+    def configure_runtime(self, compile_enabled=False, compile_mode="reduce-overhead", compile_scope="all",
+                          recompile_limit=128):
+        self.compile_scope, self.compile_recompile_limit = compile_scope, recompile_limit
+        if compile_enabled:
+            from torch._dynamo import config as dynamo_config
+
+            # Static batch buckets, configuration types and AMP dtypes need separate variants.
+            # Keep a bounded cache as in Meta's SAM3 runtime, without suppressing compiler errors.
+            dynamo_config.recompile_limit = recompile_limit
+            dynamo_config.accumulated_recompile_limit = max(dynamo_config.accumulated_recompile_limit,
+                                                           16 * recompile_limit)
         self.text_cache = {}
         self.encode_images = OptimizedCall(
             self.torch, self.model.get_vision_features, compile_enabled, compile_mode, "image encoder",
@@ -365,7 +389,8 @@ class Sam3:
             outputs = self.model(**inputs)
             return outputs.pred_masks, outputs.pred_logits
 
-        self.decode_prompts = OptimizedCall(self.torch, decode, compile_enabled, compile_mode, "prompt decoder")
+        self.decode_prompts = OptimizedCall(self.torch, decode, compile_enabled and compile_scope == "all",
+                                            compile_mode, "prompt decoder")
 
     def text_features(self, texts):
         from transformers.modeling_outputs import BaseModelOutputWithPooling
@@ -869,6 +894,10 @@ def main():
                         help="Compile encoder and prompt decoder; auto enables on Linux CUDA with Triton")
     parser.add_argument("--compile-mode", choices=("default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"),
                         default="reduce-overhead", help="torch.compile mode (default: reduce-overhead, with CUDA Graphs when supported)")
+    parser.add_argument("--compile-scope", choices=("all", "encoder"), default="all",
+                        help="Compile both stages or only the image encoder (default: all)")
+    parser.add_argument("--compile-recompile-limit", type=int, default=128,
+                        help="Dynamo variants per function before eager fallback (default: 128)")
     parser.add_argument("--tf32", action=argparse.BooleanOptionalAction, default=True,
                         help="Allow TF32 for remaining FP32 CUDA operations (default: enabled)")
     parser.add_argument("--prefetch", action=argparse.BooleanOptionalAction, default=True,
@@ -878,6 +907,8 @@ def main():
         parser.error("--batch-size and --image-batch-size must be positive")
     if args.gpus is not None and args.gpus < 1:
         parser.error("--gpus must be positive")
+    if args.compile_recompile_limit < 1:
+        parser.error("--compile-recompile-limit must be positive")
     try:
         run(args)
     except (ImportError, KeyError, OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
