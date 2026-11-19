@@ -19,8 +19,14 @@ It keeps the public Seg Large preset's 200 queries. The
 optimizer and EMA use the public RF-DETR implementation for details absent
 from the paper.
 
---batch-size sets the microbatch on each GPU. The effective batch per optimizer
-update is batch_size * devices * num_nodes * grad_accum_steps.
+The launcher uses 16 training images per GPU by default, including when a
+legacy command passes --batch-size. Use --batch-size-override to set a different
+microbatch. The effective batch also includes all GPUs and grad_accum_steps.
+
+The launcher automatically resumes from last.ckpt in --output-dir. It updates
+that file at epoch end and every --checkpoint-every-n-steps optimizer updates.
+The restored model and optimizer train through an interrupted epoch again using
+the current GPU and batch configuration.
 
 Use --wandb-project to log metrics to W&B. The run identity is saved in the
 Lightning checkpoint, so --resume reconnects to it automatically.
@@ -37,6 +43,7 @@ from importlib.metadata import PackageNotFoundError, version
 import math
 import os
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Literal
 from unittest.mock import patch
 
@@ -60,7 +67,7 @@ class Args:
     output_dir: Path
     # Maximum number of training epochs.
     epochs: int = 60
-    # Training images per GPU per microbatch.
+    # Legacy launch argument. The CLI uses 16 unless --batch-size-override is set.
     batch_size: int = 4
     # Validation images per GPU, independent of the training microbatch.
     eval_batch_size: int = 16
@@ -96,6 +103,12 @@ class Args:
     pretrain_weights: Path | None = None
     # Lightning checkpoint to resume from.
     resume: Path | None = None
+    # Override the launcher's training microbatch (images per GPU).
+    batch_size_override: int | None = None
+    # Resume from output_dir/last.ckpt when no checkpoint source was specified.
+    auto_resume: bool = True
+    # Optimizer updates between writes to last.ckpt. Use 0 to save only at epoch end.
+    checkpoint_every_n_steps: int = 100
 
     def __post_init__(self) -> None:
         if self.epochs < 1:
@@ -103,12 +116,27 @@ class Args:
         if min(self.batch_size, self.eval_batch_size, self.devices, self.num_nodes, self.grad_accum_steps,
                self.early_stopping_patience) < 1 or self.num_workers < 0:
             raise ValueError("Batch sizes, devices, nodes, accumulation and patience must be positive. Workers must be nonnegative.")
+        if self.batch_size_override is not None:
+            if self.batch_size_override < 1:
+                raise ValueError("--batch-size-override must be positive.")
+            self.batch_size = self.batch_size_override
+        if self.checkpoint_every_n_steps < 0:
+            raise ValueError("--checkpoint-every-n-steps must be nonnegative.")
         if not math.isfinite(self.early_stopping_min_delta) or self.early_stopping_min_delta < 0:
             raise ValueError("Early stopping min_delta must be finite and nonnegative.")
-        if self.reset_early_stopping and self.resume is None:
-            raise ValueError("--reset-early-stopping requires --resume.")
         if not all(math.isfinite(lr) and lr > 0 for lr in (self.lr, self.lr_encoder)):
             raise ValueError("Learning rates must be positive and finite.")
+        if self.output_dir.exists() and not self.output_dir.is_dir():
+            raise ValueError(f"--output-dir must be a directory: {self.output_dir}")
+
+        last_checkpoint = self.output_dir / "last.ckpt"
+        if self.resume is None and (last_checkpoint.exists() or last_checkpoint.is_symlink()):
+            if not self.auto_resume or self.dinov2_weights is not None or self.pretrain_weights is not None:
+                raise ValueError("The output directory already contains last.ckpt. Use --resume or a new directory.")
+            self.resume = last_checkpoint
+        if self.reset_early_stopping and self.resume is None:
+            raise ValueError("--reset-early-stopping requires a resume checkpoint.")
+
         checkpoints = (self.dinov2_weights, self.pretrain_weights, self.resume)
         if sum(path is not None for path in checkpoints) > 1:
             raise ValueError("--dinov2-weights, --pretrain-weights and --resume are mutually exclusive.")
@@ -121,10 +149,6 @@ class Args:
                 raise ValueError(f"Missing {checkpoint}")
         if self.resume is not None and self.resume.suffix != ".ckpt":
             raise ValueError("--resume requires a Lightning .ckpt checkpoint.")
-        if self.output_dir.exists() and not self.output_dir.is_dir():
-            raise ValueError(f"--output-dir must be a directory: {self.output_dir}")
-        if self.resume is None and (self.output_dir / "last.ckpt").exists():
-            raise ValueError("The output directory already contains last.ckpt. Use --resume or a new directory.")
 
 
 def make_wandb_logger(args: Args):
@@ -402,6 +426,64 @@ def configure_resumed_early_stopping(checkpoint, *, patience, reset=False):
     print(f"Reset resumed early stopping: wait_count=0/{patience}, historical best mAP={best:.8f}.")
 
 
+def restart_interrupted_epoch(checkpoint):
+    """Restore optimizer progress and let Lightning rebuild the current epoch's data loop."""
+    fit_loop = checkpoint.get("loops", {}).get("fit_loop")
+    if fit_loop is None:
+        return
+    progress = fit_loop["epoch_progress"]
+    if progress["current"]["started"] <= progress["current"]["processed"]:
+        return
+
+    # The RF-DETR data loader has no checkpointable cursor. Mark the unfinished
+    # epoch as pending so Lightning resets the per-epoch batch/accumulation counters.
+    for epoch in (progress["current"], progress["total"]):
+        epoch["ready"] = epoch["started"] = epoch["processed"]
+    batches = fit_loop["epoch_loop.batch_progress"]["total"]
+    batches["completed"] = batches["processed"]
+    # A step checkpoint is written before Lightning advances its logging counter.
+    fit_loop["epoch_loop.state_dict"]["_batches_that_stepped"] = checkpoint["global_step"]
+
+
+def make_step_checkpoint(output_dir: Path, interval: int):
+    from pytorch_lightning.callbacks import ModelCheckpoint
+
+    class StepCheckpoint(ModelCheckpoint):
+        @property
+        def state_key(self):
+            # Changing the save interval does not change the checkpoint's destination.
+            return "Objects365StepCheckpoint"
+
+    return StepCheckpoint(
+        dirpath=output_dir, filename="last", every_n_train_steps=interval,
+        save_top_k=-1, enable_version_counter=False, auto_insert_metric_name=False,
+    )
+
+
+def make_checkpoint_io():
+    import torch
+    from pytorch_lightning.plugins.io import TorchCheckpointIO
+
+    class LastCheckpointIO(TorchCheckpointIO):
+        def save_checkpoint(self, checkpoint, path, storage_options=None):
+            path = Path(path)
+            if path.name != "last.ckpt" or storage_options is not None:
+                return super().save_checkpoint(checkpoint, path, storage_options)
+
+            # Use the destination filesystem so replacement stays atomic when
+            # the cluster's temporary directory and checkpoint storage differ.
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(dir=path.parent, prefix=".last.ckpt.", suffix=".tmp", delete=False) as file:
+                temporary_path = Path(file.name)
+            try:
+                torch.save(checkpoint, temporary_path)
+                temporary_path.replace(path)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+
+    return LastCheckpointIO()
+
+
 def train(args: Args) -> None:
     validate_distributed_environment(args)
     from pytorch_lightning.utilities.rank_zero import rank_zero_only
@@ -421,6 +503,7 @@ def train(args: Args) -> None:
         def on_load_checkpoint(self, checkpoint):
             super().on_load_checkpoint(checkpoint)
             checkpoint["state_dict"] = align_compiled_state_dict(self, checkpoint["state_dict"])
+            restart_interrupted_epoch(checkpoint)
             configure_resumed_early_stopping(
                 checkpoint, patience=args.early_stopping_patience, reset=args.reset_early_stopping,
             )
@@ -539,7 +622,10 @@ def train(args: Args) -> None:
     elif args.resume is None:
         load_dinov2(model.model.backbone[0].encoder.encoder, args.dinov2_weights)
 
-    trainer = build_trainer(train_config, model_config, log_every_n_steps=1)
+    trainer = build_trainer(train_config, model_config, log_every_n_steps=1, plugins=[make_checkpoint_io()])
+    if args.checkpoint_every_n_steps:
+        # Keep RF-DETR's post-validation epoch checkpoint as well as the step saves.
+        trainer.callbacks.append(make_step_checkpoint(args.output_dir, args.checkpoint_every_n_steps))
     if wandb_logger is not None:
         trainer.loggers = [*trainer.loggers, wandb_logger]
     global_batch_size = args.batch_size * args.devices * args.num_nodes * args.grad_accum_steps
@@ -573,8 +659,9 @@ def train(args: Args) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = tyro.cli(Args, args=argv, description=__doc__)
-    # Override the training microbatch even when --batch-size is passed explicitly.
-    args.batch_size = 16
+    # Preserve the microbatch used by the fixed Slurm command.
+    if args.batch_size_override is None:
+        args.batch_size = 16
     try:
         installed_version = version("rfdetr")
     except PackageNotFoundError:
