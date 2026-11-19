@@ -488,11 +488,13 @@ def train(args: Args) -> None:
     validate_distributed_environment(args)
     from pytorch_lightning.utilities.rank_zero import rank_zero_only
     from torch._dynamo import config as dynamo_config
+    from torch.compiler import disable
     from rfdetr.config import RFDETRSegLargeConfig, SegmentationTrainConfig
     from rfdetr.datasets import coco
     from rfdetr.models import lwdetr
     from rfdetr.models._defaults import ModelDefaults
     from rfdetr.models.lwdetr import build_model_from_config
+    from rfdetr.models.ops.modules import ms_deform_attn
     from rfdetr.models.postprocess import PostProcess
     from rfdetr.training import RFDETRDataModule, RFDETRModelModule, build_trainer, module_model, seed_everything
     from rfdetr.training.callbacks.ema import RFDETREMACallback
@@ -648,12 +650,16 @@ def train(args: Args) -> None:
 
     # Supply the same scale grid to the native dataset transforms and batch
     # resize hook. RF-DETR samples by optimizer step, shared across DDP ranks.
-    with (
-        patch.object(coco, "compute_multi_scale_scales", paper_scales),
-        patch.object(module_model, "compute_multi_scale_scales", paper_scales),
-        patch.object(RFDETREMACallback, "_load_ema_weights", load_ema_weights),
-        dynamo_config.patch(recompile_limit=compile_recompile_limit),
-    ):
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(coco, "compute_multi_scale_scales", paper_scales))
+        stack.enter_context(patch.object(module_model, "compute_multi_scale_scales", paper_scales))
+        stack.enter_context(patch.object(RFDETREMACallback, "_load_ema_weights", load_ema_weights))
+        stack.enter_context(dynamo_config.patch(recompile_limit=compile_recompile_limit))
+        if args.amp_dtype == "fp8":
+            # Inductor's fused grid sampler can hit an out-of-bounds assertion
+            # in FP8 training. Use PyTorch's native sampler at this call site.
+            sample = ms_deform_attn.ms_deform_attn_core_pytorch
+            stack.enter_context(patch.object(ms_deform_attn, "ms_deform_attn_core_pytorch", disable(sample)))
         trainer.fit(model, datamodule=data, ckpt_path=args.resume)
 
 
