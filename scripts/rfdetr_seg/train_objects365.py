@@ -573,6 +573,8 @@ def train(args: Args) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     args = tyro.cli(Args, args=argv, description=__doc__)
+    # Override the training microbatch even when --batch-size is passed explicitly.
+    args.batch_size = 16
     try:
         installed_version = version("rfdetr")
     except PackageNotFoundError:
