@@ -27,8 +27,10 @@ llm-lora-cu130 = [
     "unsloth",
     "wandb",
     "vllm==0.32.0; sys_platform == 'linux'",
+    "torch",
+    "torchvision",
 ]
-rfdetrn = [
+rfdetrn-common = [
     "rfdetr[train,augment]==1.11.2",
     "albumentations==2.0.8",
     "pytorch-lightning==2.6.5",
@@ -37,10 +39,23 @@ rfdetrn = [
     "wandb==0.25.0",
     "pyyaml",
 ]
+rfdetrn = [
+    { include-group = "rfdetrn-common" },
+    "torch",
+    "torchvision",
+]
 rfdetrn-fp8 = [
-    { include-group = "rfdetrn" },
-    # RF-DETR installs Transformer Engine's PyTorch extension on Linux x86-64.
+    { include-group = "rfdetrn-common" },
     "rfdetr[cuda]==1.11.2",
+    "torch==2.14.1+cu132",
+    "torchvision==0.29.1+cu132",
+    "transformer-engine[pytorch]==2.21.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    # The scheduled sync builds the extension in the project environment.
+    "cuda-toolkit[crt,cccl]==13.2.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "ninja; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "packaging; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "setuptools; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "wheel; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 sam = [
     "ijson",
@@ -58,12 +73,35 @@ environments = [
     "sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
     "sys_platform == 'win32' and platform_machine == 'AMD64'",
 ]
+conflicts = [
+    [{ group = "rfdetrn-fp8" }, { group = "llm-lora-cu130" }],
+    [{ group = "rfdetrn-fp8" }, { group = "rfdetrn" }],
+    [{ group = "rfdetrn-fp8" }, { group = "sam" }],
+]
+
+[tool.uv.extra-build-variables]
+transformer-engine-torch = { NVTE_PYTORCH_FORCE_BUILD = "TRUE" }
 
 [tool.uv.sources]
-torch = { index = "pytorch-cu130" }
-torchvision = { index = "pytorch-cu130" }
+torch = [
+    { index = "pytorch-cu132", group = "rfdetrn-fp8" },
+    { index = "pytorch-cu130", group = "llm-lora-cu130" },
+    { index = "pytorch-cu130", group = "rfdetrn" },
+    { index = "pytorch-cu130", group = "sam" },
+]
+torchvision = [
+    { index = "pytorch-cu132", group = "rfdetrn-fp8" },
+    { index = "pytorch-cu130", group = "llm-lora-cu130" },
+    { index = "pytorch-cu130", group = "rfdetrn" },
+    { index = "pytorch-cu130", group = "sam" },
+]
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
 url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/cu132"
 explicit = true
