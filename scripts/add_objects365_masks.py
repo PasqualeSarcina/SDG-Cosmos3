@@ -698,12 +698,11 @@ def open_progress(db, identity):
 
 
 def bbox_fallback(record, row):
-    import numpy as np
-
     box = prompt_box(row.get("bbox"), record["width"], record["height"])
     if box is None:
-        raise ValueError(f"Image ID {record['id']}, annotation ID {row['id']}: "
-                         f"cannot create a nonempty bbox fallback from {row.get('bbox')!r}")
+        return None
+    import numpy as np
+
     x1, y1, x2, y2 = box
     mask = np.zeros((record["height"], record["width"]), dtype=bool)
     mask[floor(y1):ceil(y2), floor(x1):ceil(x2)] = True
@@ -715,7 +714,7 @@ def write_split(index, db, args, split, target, progress):
 
     metadata = json.loads(index.execute("SELECT metadata FROM splits WHERE name=?", (split,)).fetchone()[0])
     names = {row["id"]: row["name"] for row in metadata["categories"]}
-    count = mask_count = kept = recovered = fake = crowd = 0
+    count = mask_count = kept = recovered = fake = crowd = invalid_boxes = 0
     with target.open("w", encoding="utf-8") as stream:
         stream.write(dumps(metadata)[:-1] + ',"annotations":[')
         for image_id, payload in index.execute(
@@ -738,22 +737,26 @@ def write_split(index, db, args, split, target, progress):
             annotations = []
             for row in rows:
                 result = results[str(row["id"])]
-                if row.get("iscrowd", 0) == 1:
-                    tqdm.write(
-                        f"CROWD_BBOX_MASK split={split} image_id={image_id} file={record['file_name']!r} "
+                is_crowd = row.get("iscrowd", 0) == 1
+                if is_crowd or "discard_reason" in result:
+                    context = (
+                        f"split={split} image_id={image_id} file={record['file_name']!r} "
                         f"annotation_id={row['id']} category_id={row['category_id']} "
-                        f"class={names[row['category_id']]!r} reason=iscrowd=1", file=sys.stderr,
+                        f"class={names[row['category_id']]!r}"
                     )
-                    result = bbox_fallback(record, row)
-                    crowd += 1
-                elif "discard_reason" in result:
-                    tqdm.write(
-                        f"BBOX_MASK_FALLBACK split={split} image_id={image_id} file={record['file_name']!r} "
-                        f"annotation_id={row['id']} category_id={row['category_id']} "
-                        f"class={names[row['category_id']]!r} reason={result['discard_reason']}", file=sys.stderr,
-                    )
-                    result = bbox_fallback(record, row)
-                    fake += 1
+                    fallback = bbox_fallback(record, row)
+                    if fallback is None:
+                        tqdm.write(f"SKIP_INVALID_BBOX {context} iscrowd={row.get('iscrowd', 0)} "
+                                   f"bbox={row.get('bbox')!r} reason=no_nonempty_box", file=sys.stderr)
+                        invalid_boxes += 1
+                        continue
+                    if is_crowd:
+                        tqdm.write(f"CROWD_BBOX_MASK {context} reason=iscrowd=1", file=sys.stderr)
+                        crowd += 1
+                    else:
+                        tqdm.write(f"BBOX_MASK_FALLBACK {context} reason={result['discard_reason']}", file=sys.stderr)
+                        fake += 1
+                    result = fallback
                 rle, area = result["segmentation"], result["area"]
                 if (rle["size"] != [record["height"], record["width"]] or not isinstance(rle["counts"], str)
                         or not 0 < area <= record["height"] * record["width"] or mask_utils.area(rle) != area):
@@ -781,6 +784,7 @@ def write_split(index, db, args, split, target, progress):
     return (f"{split}: {kept} images, {count} annotations, {mask_count} masks; "
             f"{fake} rectangular bbox fallback masks; "
             f"{crowd} rectangular crowd masks; "
+            f"{invalid_boxes} skipped invalid boxes; "
             f"{recovered} recovered on crops")
 
 
@@ -877,6 +881,7 @@ def main():
         "Uses the existing annotation bbox AND its category name; preserves original IDs, classes and bboxes. "
         "Crowd annotations (iscrowd=1) use rectangular bbox masks without SAM3 and log each case. "
         "Failed SAM3 masks automatically use rectangular bbox masks after crop retry, with a log for each fallback. "
+        "Annotations with unusable boxes that cannot produce a fallback mask are logged and omitted. "
         "Re-run with the same input/output to resume, including with a different number of GPUs.",
     )
     parser.add_argument("--input", required=True, type=Path, help="Roboflow COCO root containing train/ and valid/")
