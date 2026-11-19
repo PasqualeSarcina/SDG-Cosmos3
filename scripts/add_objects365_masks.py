@@ -727,7 +727,8 @@ def write_split(index, db, args, split, target, progress):
             saved = db.execute("SELECT masks FROM completed WHERE split=? AND image_id=? AND source_stamp=?",
                                (split, image_id, stamp)).fetchone()
             if saved is None:
-                raise ValueError(f"{split}: image ID {image_id} has no complete checkpoint")
+                raise ValueError(f"{split}: image ID {image_id} has no matching checkpoint. "
+                                 "Resume without --export-only to process missing or changed images.")
             results = json.loads(saved[0])
             rows = [json.loads(row[0]) for row in index.execute(
                 "SELECT payload FROM annotations WHERE split=? AND image_id=?", (split, image_id),
@@ -789,7 +790,8 @@ def write_split(index, db, args, split, target, progress):
 
 
 def run(args):
-    if args.gpus is not None:
+    export_only = getattr(args, "export_only", False)
+    if not export_only and args.gpus is not None:
         import torch
 
         visible = torch.cuda.device_count()
@@ -799,6 +801,11 @@ def run(args):
     args.input, args.output = args.input.resolve(), args.output.resolve()
     if args.input.is_relative_to(args.output) or args.output.is_relative_to(args.input):
         raise ValueError("--input and --output must be separate directory trees")
+    progress_path = args.output / ".sam3-progress.sqlite3"
+    if progress_path.is_symlink():
+        raise ValueError(f"Refusing symlink at {progress_path}")
+    if export_only and not progress_path.is_file():
+        raise ValueError(f"--export-only requires an existing checkpoint: {progress_path}")
     digests, stamps = {}, {}
     for split in SPLITS:
         path = args.input / split / COCO_FILE
@@ -806,9 +813,6 @@ def run(args):
         print(f"{split}: checking source annotations", flush=True)
         with path.open("rb") as stream:
             digests[split] = file_digest(stream, "sha256").hexdigest()
-    progress_path = args.output / ".sam3-progress.sqlite3"
-    if progress_path.is_symlink():
-        raise ValueError(f"Refusing symlink at {progress_path}")
     for split in SPLITS:
         directory = args.output / split
         if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
@@ -830,41 +834,42 @@ def run(args):
             total = index.execute("SELECT SUM(image_count) FROM splits").fetchone()[0]
             bar_options = {"total": total, "unit": "img", "dynamic_ncols": interactive,
                            "mininterval": 1 if interactive else 15}
-            failures = 0
-            description = f"SAM3 ({args.gpus} GPUs)" if args.gpus else "SAM3"
-            with tqdm(desc=description, **bar_options) as progress:
-                reused = 0
+            if not export_only:
+                failures = 0
+                description = f"SAM3 ({args.gpus} GPUs)" if args.gpus else "SAM3"
+                with tqdm(desc=description, **bar_options) as progress:
+                    reused = 0
 
-                def notify(event):
-                    nonlocal reused, failures
-                    kind, data = event
-                    if kind == "error":
-                        tqdm.write(data, file=sys.stderr)
-                    elif kind == "checked":
-                        cached, invalid = data
-                        reused += cached
-                        failures += invalid
-                        progress.set_postfix(cached=reused, invalid=failures, refresh=False)
-                        progress.update(cached + invalid)
-                    elif kind == "result":
-                        with db:
-                            db.execute("INSERT OR REPLACE INTO completed VALUES (?, ?, ?, ?)", data)
-                        progress.update()
+                    def notify(event):
+                        nonlocal reused, failures
+                        kind, data = event
+                        if kind == "error":
+                            tqdm.write(data, file=sys.stderr)
+                        elif kind == "checked":
+                            cached, invalid = data
+                            reused += cached
+                            failures += invalid
+                            progress.set_postfix(cached=reused, invalid=failures, refresh=False)
+                            progress.update(cached + invalid)
+                        elif kind == "result":
+                            with db:
+                                db.execute("INSERT OR REPLACE INTO completed VALUES (?, ?, ?, ?)", data)
+                            progress.update()
+                        else:
+                            raise RuntimeError(f"Unknown worker event: {kind}")
+
+                    batches = iter_batches(index, db, args)
+                    if args.gpus and args.gpus > 1:
+                        infer_on_gpus(args, batches, notify)
                     else:
-                        raise RuntimeError(f"Unknown worker event: {kind}")
-
-                batches = iter_batches(index, db, args)
-                if args.gpus and args.gpus > 1:
-                    infer_on_gpus(args, batches, notify)
-                else:
-                    predict = lazy_predict(args)
-                    for prepared in prefetch_batches(args, batches):
-                        process_prepared_batch(args, prepared, predict, notify)
-            if failures:
-                raise ValueError(f"{failures} unreadable/invalid images. Coverage is incomplete; fix and resume.")
+                        predict = lazy_predict(args)
+                        for prepared in prefetch_batches(args, batches):
+                            process_prepared_batch(args, prepared, predict, notify)
+                if failures:
+                    raise ValueError(f"{failures} unreadable/invalid images. Coverage is incomplete; fix and resume.")
             for split in SPLITS:
                 if source_stamp(args.input / split / COCO_FILE) != stamps[split]:
-                    raise OSError(f"{split}: source JSON changed during inference")
+                    raise OSError(f"{split}: source JSON changed before export")
             summaries = []
             with tqdm(desc="COCO export", **bar_options) as progress, ExitStack() as stack:
                 for split in SPLITS:
@@ -886,6 +891,8 @@ def main():
     )
     parser.add_argument("--input", required=True, type=Path, help="Roboflow COCO root containing train/ and valid/")
     parser.add_argument("--output", required=True, type=Path, help="Separate output directory")
+    parser.add_argument("--export-only", action="store_true",
+                        help="Export a complete checkpoint directly, checking images and masks during export. No GPU needed.")
     devices = parser.add_mutually_exclusive_group()
     devices.add_argument("--device", default="auto", help="PyTorch device (default: CUDA if available, otherwise CPU)")
     devices.add_argument("--gpus", type=int, help="Number of visible CUDA GPUs on this node (one process per GPU)")
